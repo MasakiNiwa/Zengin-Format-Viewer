@@ -253,10 +253,42 @@
       });
     }
 
+    // 規定のレコード長と食い違う場合も、ファイルの実際の長さを優先する。
+    // 規定側に合わせて切り詰めると、読み込んだだけでデータが失われてしまう。
+    if (!format.generic && format.recordLength !== recordLength) {
+      notices.push({
+        level: 'warn',
+        message: format.name + 'のレコード長は通常 ' + format.recordLength + ' 桁ですが、' +
+          'このファイルは ' + recordLength + ' 桁です。ファイルの長さのまま読み込みました。'
+      });
+    }
+
+    var shortLines = 0;
+    var longLines = 0;
     var records = lines.map(function (line) {
       var kind = KIND_BY_KUBUN[line.charAt(0)] || 'unknown';
-      return makeRecord(padRight(line, format.recordLength, ' ').slice(0, Math.max(line.length, format.recordLength)), kind);
+      if (line.length < recordLength) {
+        shortLines++;
+        line = padRight(line, recordLength, ' ');
+      } else if (line.length > recordLength) {
+        longLines++;
+      }
+      return makeRecord(line, kind);
     });
+    if (shortLines) {
+      notices.push({
+        level: 'info',
+        message: recordLength + ' 桁に満たないレコードが ' + shortLines +
+          ' 件あったため、末尾を空白で補いました。'
+      });
+    }
+    if (longLines) {
+      notices.push({
+        level: 'warn',
+        message: recordLength + ' 桁を超えるレコードが ' + longLines +
+          ' 件あります。内容はそのまま保持しています。'
+      });
+    }
 
     return {
       fileName: opts.fileName || '',

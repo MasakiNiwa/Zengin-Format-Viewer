@@ -41,11 +41,16 @@ out.push('');
 
 out.push('## 対応フォーマット一覧');
 out.push('');
-out.push('| 種別コード | 名称 | 概要 |');
-out.push('| --- | --- | --- |');
+out.push('| 種別コード | 名称 | レコード長 | レイアウト | 概要 |');
+out.push('| --- | --- | --- | --- | --- |');
 for (const fmt of Formats.listFormats()) {
-  out.push(`| \`${fmt.code}\` | ${fmt.name} | ${esc(fmt.description)} |`);
+  out.push(`| \`${fmt.code}\` | ${fmt.name} | ${fmt.recordLength} 桁 | ` +
+    `${fmt.layoutPending ? '未登録' : '登録済み'} | ${esc(fmt.description)} |`);
 }
+out.push('');
+out.push('「レイアウト未登録」のフォーマットは、種別コードとレコード長は判定できますが、');
+out.push('項目ごとの桁位置は登録されていません。レコード分割・構成の検証・原文の編集と書き出しは行えます。');
+out.push('項目名つきの表示には、金融機関の仕様書に基づく桁位置の登録が必要です。');
 out.push('');
 out.push('上記以外の種別コードのファイルも読み込めますが、桁の意味は解釈せず原文表示になります。');
 out.push('');
@@ -57,6 +62,19 @@ for (const fmt of Formats.listFormats()) {
   out.push('');
   out.push(esc(fmt.description));
   out.push('');
+  if (fmt.layoutPending) {
+    out.push(`- **レコード長**: ${fmt.recordLength} 桁`);
+    out.push('- **レコード構成**: ヘッダー(1) → データ(2)×n → トレーラー(8) → エンド(9)');
+    out.push('- **項目レイアウト**: 未登録');
+    out.push('');
+    if (fmt.source) out.push(`> ${esc(fmt.source)}`);
+    out.push('>');
+    out.push('> 桁位置を誤ると、画面上は正しく見えたまま誤った金額や日付を示してしまうため、');
+    out.push('> 確認できていないレイアウトは実装していません。');
+    out.push('> お取引金融機関の仕様書をお持ちの方は Issue でご提供いただけると助かります。');
+    out.push('');
+    continue;
+  }
   for (const kind of Zengin.KIND_ORDER) {
     const def = fmt.records[kind];
     if (!def) continue;

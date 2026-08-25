@@ -173,6 +173,39 @@ try {
   check('13 レコード × 122 バイト（120 桁 + CRLF）', buffer.length === 13 * 122, String(buffer.length));
   check('CRLF 区切り', buffer[120] === 0x0d && buffer[121] === 0x0a);
 
+  console.log('\n入出金系フォーマット（200 桁・レイアウト未登録）');
+  {
+    // 種別コード 03（入出金取引明細）を模した 200 桁のファイルを読み込ませる
+    const sample = path.join(root, 'tools', '.browser-test-200.txt');
+    const line = (kubun, rest = '') => (kubun + rest).padEnd(200, ' ');
+    fs.writeFileSync(sample, Buffer.from(
+      [line('1', '030'), line('2'), line('2'), line('2'), line('8'), line('9')]
+        .join('\r\n') + '\r\n', 'binary'));
+    await page.evaluate(() => { window.onbeforeunload = null; });
+    await page.goto(base, { waitUntil: 'networkidle' });
+    await page.locator('#file-input').setInputFiles(sample);
+    await page.waitForTimeout(700);
+    fs.unlinkSync(sample);
+
+    check('種別コード 03 を識別', (await page.locator('#format-code').textContent()).trim() === '03');
+    check('名称を表示', (await page.locator('#format-name').textContent()).includes('入出金取引明細'));
+    check('200 桁として読み込む',
+      (await page.locator('#file-meta').textContent()).includes('200桁'));
+    check('データ件数を数える', (await page.locator('#tab-count-data').textContent()).trim() === '3');
+    check('レイアウト未登録の案内を出す',
+      (await page.locator('#panel-summary .notice-card').innerText()).includes('項目レイアウトが未登録'));
+    check('検証エラーなし', await page.locator('.docbar-stats .chip-err').count() === 0);
+
+    await page.locator('.tab[data-tab="raw"]').click();
+    await page.waitForTimeout(300);
+    const rulerEnd = await page.evaluate(() => {
+      const ruler = document.querySelector('.raw-ruler .raw-body div:last-child');
+      return ruler.textContent.length;
+    });
+    check('桁目盛りが 200 桁ぶん出る', rulerEnd === 200, String(rulerEnd));
+    check('レコード行が 6 件', await page.locator('.raw-row').count() === 6);
+  }
+
   console.log('\nテーマとレスポンシブ');
   await page.locator('#btn-theme').click();
   await page.waitForTimeout(250);

@@ -116,6 +116,40 @@ console.log('\n新規レコードの初期値');
   check('未入力の必須項目は指摘される', required.length > 0);
 }
 
+console.log('\n入出金系フォーマット（レイアウト未登録）');
+{
+  const codec = Charset.getCodec('shift_jis');
+  const line = (kubun, rest = '') => (kubun + rest).padEnd(200, ' ');
+  for (const [code, name] of [['01', '振込入金通知'], ['02', '残高通知'], ['03', '入出金取引明細']]) {
+    const text = [line('1', `${code}0`), line('2'), line('2'), line('8'), line('9')]
+      .join('\r\n') + '\r\n';
+    const bytes = codec.encode(text);
+    const doc = Zengin.parse(bytes, { fileName: `${name}.txt` });
+    check(`${name} (${code}): 種別コードで識別`,
+      doc.format.code === code && doc.format.name === name && !doc.format.generic);
+    check(`${name} (${code}): レコード長 200 桁`, doc.recordLength === 200 &&
+      doc.records.every((r) => r.text.length === 200));
+    check(`${name} (${code}): レイアウト未登録の印`, doc.format.layoutPending === true);
+    check(`${name} (${code}): データ件数を数える`, Zengin.summarize(doc).count === 2);
+    const out = Zengin.serialize(doc);
+    check(`${name} (${code}): バイト完全一致で書き戻し`,
+      out.length === bytes.length && out.every((b, i) => b === bytes[i]));
+    const errors = Zengin.validate(doc).filter((i) => i.level === 'error');
+    check(`${name} (${code}): エラー 0 件`, errors.length === 0,
+      errors.slice(0, 2).map((e) => e.message).join(' / '));
+  }
+
+  // 規定と違うレコード長でも、切り詰めずに読み込むこと
+  const odd = codec.encode(['1030' + '0'.repeat(246), '9' + ' '.repeat(249)].join('\r\n') + '\r\n');
+  const oddDoc = Zengin.parse(odd, {});
+  const oddOut = Zengin.serialize(oddDoc);
+  check('規定外のレコード長でも切り詰めない',
+    oddOut.length === odd.length && oddOut.every((b, i) => b === odd[i]),
+    `in=${odd.length} out=${oddOut.length}`);
+  check('レコード長の食い違いを通知',
+    oddDoc.notices.some((n) => n.level === 'warn' && n.message.includes('200 桁')));
+}
+
 console.log('\n読み込みの頑健性');
 {
   // 改行なしの連結ファイル

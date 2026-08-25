@@ -423,6 +423,19 @@ button.chip:hover { filter: brightness(.96); }
 .card-body { padding: 16px; }
 .card-body.is-tight { padding: 0; }
 
+.notice-card {
+  display: flex; gap: 13px; padding: 15px 17px; margin-bottom: 16px;
+  background: var(--info-soft); border: 1px solid var(--border);
+  border-left: 3px solid var(--info); border-radius: var(--r-lg);
+}
+.notice-icon { flex: none; width: 21px; height: 21px; margin-top: 1px; color: var(--info); }
+.notice-icon svg { width: 100%; height: 100%; fill: none; stroke: currentColor;
+  stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.notice-body { min-width: 0; }
+.notice-body strong { display: block; font-size: 13.5px; margin-bottom: 5px; }
+.notice-body p { font-size: 12.5px; color: var(--text-2); line-height: 1.75; margin-bottom: 6px; }
+.notice-body .btn { margin-top: 3px; }
+
 .summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 16px; align-items: start; }
 
 .kpi-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(158px, 1fr)); gap: 12px; margin-bottom: 16px; }
@@ -790,11 +803,17 @@ html[data-theme="dark"] .raw-seg.tint { background: rgba(123, 140, 255, .16); }
 [data-accent="amber"]   { --accent: #a4620f; --accent-soft: #fdf1dc; }
 [data-accent="rose"]    { --accent: #c32f52; --accent-soft: #fdeaef; }
 [data-accent="slate"]   { --accent: #5b6478; --accent-soft: #eceff7; }
+[data-accent="sky"]     { --accent: #0369a1; --accent-soft: #e2f2fd; }
+[data-accent="violet"]  { --accent: #6d28d9; --accent-soft: #f0e9fe; }
+[data-accent="teal"]    { --accent: #0f766e; --accent-soft: #ddf4f1; }
 html[data-theme="dark"] [data-accent="indigo"]  { --accent: #8b99ff; --accent-soft: #1d2342; }
 html[data-theme="dark"] [data-accent="emerald"] { --accent: #46d59a; --accent-soft: #10291f; }
 html[data-theme="dark"] [data-accent="amber"]   { --accent: #e5ac54; --accent-soft: #2b2214; }
 html[data-theme="dark"] [data-accent="rose"]    { --accent: #ff7d9c; --accent-soft: #2f171c; }
 html[data-theme="dark"] [data-accent="slate"]   { --accent: #97a1b8; --accent-soft: #212739; }
+html[data-theme="dark"] [data-accent="sky"]     { --accent: #6cb6ec; --accent-soft: #10263a; }
+html[data-theme="dark"] [data-accent="violet"]  { --accent: #b193fb; --accent-soft: #241a3e; }
+html[data-theme="dark"] [data-accent="teal"]    { --accent: #4fccbd; --accent-soft: #0e2a28; }
 
 /* ==================================================================
    15. レスポンシブ

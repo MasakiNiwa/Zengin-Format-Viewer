@@ -284,7 +284,14 @@
 
   function revalidate() {
     if (!state.doc) { state.issues = []; state.issuesByRecord = {}; return; }
-    state.issues = Zengin.validate(state.doc);
+    // 読み込み時の判定結果（文字コード・レコード長など）も検証結果として扱う
+    var notices = (state.doc.notices || []).map(function (notice) {
+      return {
+        level: notice.level, message: notice.message,
+        recordIndex: null, fieldKey: null, hint: notice.hint || ''
+      };
+    });
+    state.issues = notices.concat(Zengin.validate(state.doc));
     var map = {};
     state.issues.forEach(function (item) {
       if (item.recordIndex == null) return;
@@ -419,6 +426,33 @@
      概要タブ
      ================================================================ */
 
+  /** レイアウト定義が未登録のフォーマットであることを知らせる。 */
+  function buildLayoutPendingNotice() {
+    var format = state.doc.format;
+    if (!format.layoutPending) return null;
+    return h('div', { class: 'notice-card' }, [
+      h('span', { class: 'notice-icon' }, [svg(ICON.info)]),
+      h('div', { class: 'notice-body' }, [
+        h('strong', { text: format.name + '（種別コード ' + format.code + '）は、項目レイアウトが未登録です' }),
+        h('p', {
+          text: 'ファイルの識別、' + format.recordLength +
+            ' 桁ごとのレコード分割、レコード構成の検証、原文の編集と書き出しは行えます。' +
+            'ただし「入金金額」「勘定日」などの項目名つき表示は、桁位置を誤ると' +
+            '正しく見えたまま誤った数値を示してしまうため、確認できるまで行いません。'
+        }),
+        h('p', {
+          text: '桁位置の確認には「生データ」タブの桁目盛りをお使いください。' +
+            'お取引金融機関の仕様書をお持ちであれば、レイアウトを登録して' +
+            '項目名つきの表示に対応できます。'
+        }),
+        h('button', {
+          type: 'button', class: 'btn btn-sm',
+          onclick: function () { setTab('raw'); }
+        }, ['生データで桁位置を確認', icon(ICON.arrow)])
+      ])
+    ]);
+  }
+
   function kpi(label, value, unit, sub, accent) {
     return h('div', { class: 'kpi' + (accent ? ' kpi-accent' : '') }, [
       h('div', { class: 'kpi-label', text: label }),
@@ -448,6 +482,8 @@
     var avgAmount = amounts.length ? Math.round(summary.amount / amounts.length) : 0;
 
     var nodes = [];
+    var pending = buildLayoutPendingNotice();
+    if (pending) nodes.push(pending);
 
     /* --- KPI --- */
     var kpis = [
@@ -466,7 +502,7 @@
     var header = Zengin.recordsOfKind(doc, 'header')[0];
     var grid = [];
 
-    if (header && !format.generic) {
+    if (header && !format.generic && !format.layoutPending) {
       var hd = format.records.header;
       var dl = h('dl', { class: 'dl' });
       var get = function (key) {
@@ -537,7 +573,7 @@
     var formatOptions = Formats.listFormats().map(function (fmt) {
       return h('option', {
         value: fmt.code, selected: !doc.format.generic && doc.format.code === fmt.code,
-        text: fmt.code + '  ' + fmt.name
+        text: fmt.code + '  ' + fmt.name + (fmt.layoutPending ? '（レイアウト未登録）' : '')
       });
     });
     if (doc.format.generic) {
@@ -583,7 +619,15 @@
         h('div', { class: 'field' }, [
           h('div', { class: 'field-label' }, [h('span', { class: 'field-name', text: 'レコード長 / サイズ' })]),
           h('input', { class: 'field-input', value: doc.recordLength + ' 桁 / ' + formatBytes(doc.byteLength || 0), readonly: true }),
-          h('div', { class: 'field-hint', text: '全銀フォーマットは 120 桁固定です。' })
+          h('div', {
+            class: 'field-hint',
+            text: doc.format.generic
+              ? 'レイアウト定義がないため、ファイルの構成からレコード長を推定しました。'
+              : doc.format.name + 'のレコード長は ' + doc.format.recordLength + ' 桁です。' +
+                (doc.recordLength !== doc.format.recordLength
+                  ? '（このファイルは ' + doc.recordLength + ' 桁のため、その長さのまま扱います）'
+                  : '')
+          })
         ])
       ])
     ]);
@@ -661,6 +705,14 @@
     ]);
   }
 
+  /** 「問題なし」と言えるとき、実際に何を確認したのかを述べる。 */
+  function validatedScopeText() {
+    return state.doc.format.layoutPending
+      ? 'レコード構成・レコード長・文字種に問題はありません。' +
+        '項目ごとの検証は、レイアウトが未登録のため行っていません。'
+      : '桁数・文字種・必須項目・合計件数／合計金額のいずれも整合しています。';
+  }
+
   function renderValidationCard() {
     var counts = Zengin.countByLevel(state.issues);
     var body;
@@ -669,7 +721,7 @@
         svg(ICON.check),
         h('div', null, [
           h('strong', { text: '問題は見つかりませんでした' }),
-          h('span', { text: '桁数・文字種・必須項目・合計件数／合計金額のいずれも整合しています。' })
+          h('span', { text: validatedScopeText() })
         ])
       ]);
     } else {
@@ -737,7 +789,9 @@
     }
 
     var hintText = issue ? issue.message : field.hint;
-    return h('div', { class: 'field' + (field.dummy ? ' field-full' : '') }, [
+    // 極端に長い項目だけ 1 行を占有させる（120 桁側の項目配置は変えない）
+    var wide = field.dummy || field.role === 'rawBody' || field.len >= 60;
+    return h('div', { class: 'field' + (wide ? ' field-full' : '') }, [
       h('div', { class: 'field-label' }, [
         h('span', { class: 'field-name', text: field.label }),
         h('span', { class: 'field-pos', text: field.pos + '-' + field.end + ' / ' + field.len + '桁 ' + field.type }),
@@ -927,11 +981,14 @@
     var start = (state.page - 1) * state.pageSize;
     var pageRows = rows.slice(start, start + state.pageSize);
 
-    panel.replaceChildren(
-      buildDataToolbar(),
-      buildDataTable(pageRows),
-      buildDataFooter(rows.length, totalRows, pageCount, start, pageRows.length)
-    );
+    var children = [buildDataToolbar()];
+    var pending = buildLayoutPendingNotice();
+    if (pending) {
+      children.push(h('div', { style: 'padding: 14px 16px 0' }, [pending]));
+    }
+    children.push(buildDataTable(pageRows));
+    children.push(buildDataFooter(rows.length, totalRows, pageCount, start, pageRows.length));
+    panel.replaceChildren.apply(panel, children);
   }
 
   function buildDataToolbar() {
@@ -1474,7 +1531,7 @@
         svg(ICON.check),
         h('div', null, [
           h('strong', { text: '問題は見つかりませんでした' }),
-          h('span', { text: 'レコード構成・桁数・文字種・必須項目・合計金額のすべてが整合しています。' })
+          h('span', { text: validatedScopeText() })
         ])
       ]));
       return;

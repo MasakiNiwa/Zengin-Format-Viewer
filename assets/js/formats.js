@@ -245,6 +245,74 @@
   };
 
   /* ------------------------------------------------------------------ *
+   * 入出金系（照会・通知）フォーマット
+   *
+   * 銀行から受け取る入金・残高データで、レコード長は 200 バイト。
+   * 種別コードとレコード構成は確認できているが、項目ごとの桁位置は
+   * 金融機関の仕様書で確認できていないため、桁の意味は解釈せず
+   * 「レイアウト定義の登録待ち（layoutPending）」として扱う。
+   *
+   * 誤った桁位置で金額や日付を表示すると、画面上は正しく見えたまま
+   * 誤った数値を信じさせてしまうため、推測での実装は行わない。
+   * ------------------------------------------------------------------ */
+
+  /**
+   * 種別コードとレコード長だけが判明しているフォーマットを定義する。
+   * ファイルの識別・レコード分割・構成の検証は行い、項目の解釈はしない。
+   */
+  function pendingFormat(spec) {
+    var len = spec.recordLength || 200;
+    function body(kubun, label, extra) {
+      var fields = [
+        f('kubun', 'データ区分', 1, 'N',
+          { fixed: kubun, role: 'kubun', codes: CODE.kubun, required: true })
+      ];
+      var used = 1;
+      if (extra) {
+        fields.push(f('typeCode', '種別コード', 2, 'N',
+          { fixed: spec.code, role: 'typeCode', required: true }));
+        used += 2;
+      }
+      fields.push(f('body', 'レコード内容', len - used, 'C', { role: 'rawBody' }));
+      return record(kubun, label, fields);
+    }
+    return {
+      code: spec.code,
+      name: spec.name,
+      shortName: spec.shortName,
+      accent: spec.accent,
+      description: spec.description,
+      recordLength: len,
+      layoutPending: true,
+      source: spec.source,
+      records: {
+        header: body('1', 'ヘッダーレコード', true),
+        data: body('2', 'データレコード'),
+        trailer: body('8', 'トレーラーレコード'),
+        end: body('9', 'エンドレコード')
+      }
+    };
+  }
+
+  var FURIKOMI_NYUKIN = pendingFormat({
+    code: '01', name: '振込入金通知', shortName: '振入', accent: 'sky',
+    description: '自社口座への振込入金の明細を銀行から受け取るためのフォーマットです。',
+    source: '種別コード・レコード長は金融機関の公開仕様で確認済み。項目の桁位置は未登録です。'
+  });
+
+  var ZANDAKA = pendingFormat({
+    code: '02', name: '残高通知', shortName: '残高', accent: 'violet',
+    description: '口座残高を銀行から受け取るためのフォーマットです。',
+    source: '種別コード・レコード長は金融機関の公開仕様で確認済み。項目の桁位置は未登録です。'
+  });
+
+  var NYUSHUKKIN = pendingFormat({
+    code: '03', name: '入出金取引明細', shortName: '入出金', accent: 'teal',
+    description: '口座の入出金取引明細を銀行から受け取るためのフォーマットです。',
+    source: '種別コード・レコード長は金融機関の公開仕様で確認済み。項目の桁位置は未登録です。'
+  });
+
+  /* ------------------------------------------------------------------ *
    * 汎用（種別コード 未知）
    * ------------------------------------------------------------------ */
 
@@ -283,7 +351,8 @@
    * ------------------------------------------------------------------ */
 
   var FORMATS = {};
-  [SOGO_FURIKOMI, KYUYO, SHOYO, KOZA_FURIKAE].forEach(function (fmt) {
+  [SOGO_FURIKOMI, KYUYO, SHOYO, KOZA_FURIKAE,
+    FURIKOMI_NYUKIN, ZANDAKA, NYUSHUKKIN].forEach(function (fmt) {
     FORMATS[fmt.code] = fmt;
   });
 
