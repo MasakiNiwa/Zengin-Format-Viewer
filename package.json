@@ -1,0 +1,17 @@
+{
+  "name": "zengin-format-viewer",
+  "version": "1.0.0",
+  "description": "全銀協制定フォーマット（全銀固定長データ）をブラウザ上で表示・編集・再出力するツール",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "test": "node tools/selftest.mjs",
+    "docs": "node tools/gen-format-doc.mjs",
+    "start": "python3 -m http.server 8000"
+  },
+  "keywords": ["全銀", "zengin", "総合振込", "給与振込", "預金口座振替", "固定長"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/MasakiNiwa/Zengin-Format-Viewer.git"
+  }
+}

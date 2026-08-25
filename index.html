@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>全銀フォーマットビューア | 全銀固定長データを表形式で確認・編集</title>
+<meta name="description" content="全銀協制定フォーマット（総合振込・給与振込・賞与振込・預金口座振替）の固定長テキストを、ブラウザ上で表形式に表示・編集し、再び全銀形式で書き出せるツールです。データは端末外に送信されません。">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#4457e6">
+<link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="assets/css/app.css">
+</head>
+<body data-view="welcome">
+
+<!-- ================= アプリバー ================= -->
+<header class="appbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M9 9v11M3 14h6"/>
+      </svg>
+    </span>
+    <span class="brand-text">
+      <strong>全銀フォーマットビューア</strong>
+      <small>Zengin Format Viewer</small>
+    </span>
+  </div>
+
+  <div class="appbar-actions">
+    <button type="button" class="btn btn-primary" id="btn-open">
+      <svg viewBox="0 0 24 24" class="icon" aria-hidden="true"><path d="M4 19V6a2 2 0 0 1 2-2h4l2 2h6a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"/></svg>
+      <span class="btn-label">ファイルを開く</span>
+    </button>
+    <div class="menu" data-menu data-requires-doc>
+      <button type="button" class="btn" data-menu-trigger aria-haspopup="true" aria-expanded="false">
+        <svg viewBox="0 0 24 24" class="icon" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
+        <span class="btn-label">書き出し</span>
+        <svg viewBox="0 0 24 24" class="icon caret" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+      </button>
+      <div class="menu-panel" data-menu-panel role="menu">
+        <button type="button" role="menuitem" id="btn-save-zengin">
+          <span class="menu-title">全銀固定長で保存</span>
+          <span class="menu-note">編集内容を元の形式に戻して出力</span>
+        </button>
+        <button type="button" role="menuitem" id="btn-save-csv">
+          <span class="menu-title">CSV で保存</span>
+          <span class="menu-note">Excel で開ける明細一覧（UTF-8）</span>
+        </button>
+      </div>
+    </div>
+    <span class="appbar-sep" aria-hidden="true"></span>
+    <button type="button" class="btn btn-ghost" id="btn-help" aria-haspopup="dialog">
+      <svg viewBox="0 0 24 24" class="icon" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M9.6 9a2.5 2.5 0 1 1 3.3 2.4c-.6.2-.9.8-.9 1.4v.4"/><circle cx="12" cy="16.6" r=".7" fill="currentColor" stroke="none"/></svg>
+      <span class="btn-label">ヘルプ</span>
+    </button>
+    <button type="button" class="btn btn-icon" id="btn-theme" title="表示テーマを切り替え" aria-label="表示テーマを切り替え">
+      <svg viewBox="0 0 24 24" class="icon icon-sun" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M2 12h2m16 0h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+      <svg viewBox="0 0 24 24" class="icon icon-moon" aria-hidden="true"><path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5z"/></svg>
+    </button>
+  </div>
+</header>
+
+<input type="file" id="file-input" accept=".txt,.dat,.zgn,.csv,text/plain" hidden>
+
+<!-- ================= 初期画面 ================= -->
+<main class="welcome" id="welcome">
+  <div class="welcome-inner">
+    <h1 class="welcome-title">全銀固定長データを、<br>そのまま表で確かめる。</h1>
+    <p class="welcome-lead">全銀協制定フォーマットのテキストファイルを読み込むと、ヘッダーレコードの種別コードからフォーマットを自動判定し、項目名つきの表として表示します。編集した内容は、元どおりの固定長形式で書き出せます。</p>
+
+    <div class="dropzone" id="dropzone" tabindex="0" role="button"
+         aria-label="全銀ファイルを選択、またはドラッグ＆ドロップ">
+      <span class="dropzone-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 16V4m0 0L8 8m4-4 4 4"/><path d="M4 15v3a3 3 0 0 0 3 3h10a3 3 0 0 0 3-3v-3"/>
+        </svg>
+      </span>
+      <p class="dropzone-title">ここにファイルをドラッグ＆ドロップ</p>
+      <p class="dropzone-sub">またはクリックしてファイルを選択（.txt / .dat など）</p>
+    </div>
+
+    <div class="welcome-samples">
+      <p class="welcome-samples-label">試しに使う — サンプルデータ</p>
+      <div class="sample-chips" id="sample-chips"></div>
+    </div>
+
+    <ul class="feature-grid">
+      <li>
+        <span class="feature-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>
+        </span>
+        <div>
+          <h3>データは端末の外に出ません</h3>
+          <p>読み込み・編集・書き出しのすべてがブラウザ内で完結します。サーバーへの送信は一切ありません。</p>
+        </div>
+      </li>
+      <li>
+        <span class="feature-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h16M4 12h16M4 18h10"/><circle cx="19" cy="18" r="2.5"/></svg>
+        </span>
+        <div>
+          <h3>種別コードを自動判定</h3>
+          <p>総合振込・給与振込・賞与振込・預金口座振替に対応。未対応の種別も原文のまま安全に表示します。</p>
+        </div>
+      </li>
+      <li>
+        <span class="feature-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+        </span>
+        <div>
+          <h3>桁数・文字種・合計を自動チェック</h3>
+          <p>使用できない文字、必須項目もれ、トレーラーの合計不一致などを読み込み時に洗い出します。</p>
+        </div>
+      </li>
+      <li>
+        <span class="feature-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v13m0 0 4-4m-4 4-4-4"/><path d="M5 19h14"/></svg>
+        </span>
+        <div>
+          <h3>編集して全銀形式で再出力</h3>
+          <p>表の上で直接修正でき、桁揃え（数字は右詰 0 埋め・文字は左詰空白埋め）は自動で行われます。</p>
+        </div>
+      </li>
+    </ul>
+  </div>
+</main>
+
+<!-- ================= 作業画面 ================= -->
+<main class="workspace" id="workspace" hidden>
+
+  <div class="docbar">
+    <div class="docbar-main">
+      <span class="format-badge" id="format-badge">
+        <span class="format-code" id="format-code">--</span>
+        <span class="format-name" id="format-name">未読込</span>
+      </span>
+      <div class="docbar-file">
+        <span class="file-name" id="file-name">-</span>
+        <span class="file-meta" id="file-meta"></span>
+      </div>
+    </div>
+    <div class="docbar-stats" id="docbar-stats"></div>
+  </div>
+
+  <nav class="tabs" id="tabs" role="tablist" aria-label="表示切り替え">
+    <button type="button" role="tab" class="tab is-active" data-tab="summary" aria-controls="panel-summary" aria-selected="true">概要</button>
+    <button type="button" role="tab" class="tab" data-tab="header" aria-controls="panel-header" aria-selected="false">ヘッダー</button>
+    <button type="button" role="tab" class="tab" data-tab="data" aria-controls="panel-data" aria-selected="false">
+      データ明細 <span class="tab-count" id="tab-count-data">0</span>
+    </button>
+    <button type="button" role="tab" class="tab" data-tab="trailer" aria-controls="panel-trailer" aria-selected="false">トレーラー</button>
+    <button type="button" role="tab" class="tab" data-tab="raw" aria-controls="panel-raw" aria-selected="false">生データ</button>
+    <button type="button" role="tab" class="tab" data-tab="issues" aria-controls="panel-issues" aria-selected="false">
+      検証 <span class="tab-count" id="tab-count-issues">0</span>
+    </button>
+  </nav>
+
+  <div class="panels">
+    <section class="panel is-active" id="panel-summary" role="tabpanel" tabindex="0"></section>
+    <section class="panel" id="panel-header" role="tabpanel" tabindex="0"></section>
+    <section class="panel panel-flush" id="panel-data" role="tabpanel" tabindex="0"></section>
+    <section class="panel" id="panel-trailer" role="tabpanel" tabindex="0"></section>
+    <section class="panel panel-flush" id="panel-raw" role="tabpanel" tabindex="0"></section>
+    <section class="panel" id="panel-issues" role="tabpanel" tabindex="0"></section>
+  </div>
+</main>
+
+<!-- ================= ヘルプ ================= -->
+<dialog class="dialog dialog-help" id="help-dialog" aria-labelledby="help-title">
+  <form method="dialog" class="dialog-head">
+    <h2 id="help-title">使い方ガイド</h2>
+    <button type="submit" class="btn btn-icon" aria-label="閉じる">
+      <svg viewBox="0 0 24 24" class="icon" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+    </button>
+  </form>
+  <div class="dialog-body">
+    <nav class="help-nav" id="help-nav"></nav>
+    <div class="help-content" id="help-content"></div>
+  </div>
+</dialog>
+
+<!-- ================= 汎用ダイアログ ================= -->
+<dialog class="dialog dialog-confirm" id="confirm-dialog" aria-labelledby="confirm-title">
+  <h2 id="confirm-title">確認</h2>
+  <p id="confirm-message"></p>
+  <div class="dialog-actions">
+    <button type="button" class="btn" id="confirm-cancel">キャンセル</button>
+    <button type="button" class="btn btn-danger" id="confirm-ok">実行</button>
+  </div>
+</dialog>
+
+<div class="toast-host" id="toast-host" aria-live="polite" aria-atomic="false"></div>
+
+<script src="assets/js/charset.js"></script>
+<script src="assets/js/formats.js"></script>
+<script src="assets/js/zengin.js"></script>
+<script src="assets/js/samples.js"></script>
+<script src="assets/js/help.js"></script>
+<script src="assets/js/app.js"></script>
+</body>
+</html>
