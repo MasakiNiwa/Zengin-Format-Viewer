@@ -330,7 +330,8 @@
       fileName: '', encoding: 'shift_jis', encodingDetection: null,
       lineEnding: 'CRLF', recordLength: format.recordLength, format: format,
       detectedTypeCode: format.code, formatOverridden: false,
-      records: records, notices: [], variantKey: format.variantKey || null, byteLength: 0
+      records: records, notices: [], variantKey: format.variantKey || null,
+      hasBom: false, trailingNewline: true, byteLength: 0
     };
   }
 

@@ -186,6 +186,19 @@
         class: 'issue-summary', style: 'margin-bottom:12px'
       }, chips));
 
+      var diff = computeDiff();
+      if (diff.total) {
+        status.appendChild(h('div', {
+          class: 'issue-summary', style: 'margin-bottom:12px'
+        }, [
+          h('span', { class: 'chip chip-info' }, ['読み込み後の変更 ' + num(diff.total) + ' 件']),
+          h('button', {
+            type: 'button', class: 'btn btn-sm',
+            onclick: function () { dialog.close(); openDiff(); }
+          }, ['変更内容を見る', icon(ICON.arrow)])
+        ]));
+      }
+
       var meta = $('#export-meta');
       meta.replaceChildren();
       info.meta.forEach(function (row) {
@@ -206,6 +219,7 @@
       };
       $('#export-ok').onclick = function () { done(true); };
       $('#export-cancel').onclick = function () { done(false); };
+      $('#diff-close').onclick = function () { $('#diff-dialog').close(); };
       dialog.onclose = function () { resolve(false); };
       dialog.showModal();
     });
@@ -230,6 +244,7 @@
   var state = {
     doc: null,
     rawBytes: null,
+    baseline: null,     // 読み込み直後の内容（差分表示用・メモリ内のみ）
     activeTab: 'summary',
     issues: [],
     issuesByRecord: {},
@@ -287,11 +302,12 @@
       state.doc = doc;
       state.rawBytes = bytes;
       state.dirty = false;
+      state.baseline = snapshot(doc);
       state.page = 1;
       state.rawPage = 1;
       state.search = '';
       state.sortKey = null;
-      state.groupIndex = null;
+      state.groupIndex = Zengin.hasMixedVariants(doc) ? 0 : null;
       state.selected = null;
       state.rawSelectedId = null;
       document.body.dataset.view = 'workspace';
@@ -330,6 +346,245 @@
   function guardUnsaved(action) {
     if (!state.dirty) return Promise.resolve(true);
     return confirmAction('編集中の内容は破棄されます。よろしいですか？', action || '破棄して続行');
+  }
+
+  /* ================================================================
+     読み込み後の変更内容（差分）
+
+     読み込み直後の内容をメモリ上に控えておき、現在の状態と突き合わせる。
+     機微な情報を含むため、ブラウザの外に出さず、保存もしない。
+     ================================================================ */
+
+  function snapshot(doc) {
+    return {
+      records: doc.records.map(function (rec) {
+        return { id: rec.id, kind: rec.kind, text: rec.text };
+      }),
+      order: doc.records.map(function (rec) { return rec.id; })
+    };
+  }
+
+  /** 差分の見出しに使うレコード名。 */
+  function recordCaption(doc, kind, number) {
+    var def = doc.format.records[kind];
+    var label = def ? def.label : 'レコード';
+    return number != null ? label + '（第 ' + number + ' レコード）' : label;
+  }
+
+  /**
+   * 読み込み直後と現在の状態を比べる。
+   * レコードは読み込み時に割り振った ID で対応づけるため、
+   * 並べ替えや行の増減があっても取り違えない。
+   */
+  function computeDiff() {
+    var empty = { changed: [], added: [], removed: [], reordered: false, total: 0 };
+    if (!state.doc || !state.baseline) return empty;
+
+    var doc = state.doc;
+    var before = Object.create(null);
+    state.baseline.records.forEach(function (rec, index) {
+      before[rec.id] = { rec: rec, index: index };
+    });
+    var currentIds = Object.create(null);
+    var defs = Zengin.dataDefMap(doc);
+
+    var changed = [];
+    var added = [];
+    doc.records.forEach(function (rec, index) {
+      currentIds[rec.id] = true;
+      var origin = before[rec.id];
+      if (!origin) {
+        added.push({ record: rec, index: index, kind: rec.kind });
+        return;
+      }
+      if (origin.rec.text === rec.text) return;
+
+      var def = rec.kind === 'data'
+        ? (defs[rec.id] || doc.format.records.data)
+        : doc.format.records[rec.kind];
+      var fields = [];
+      if (def) {
+        def.fields.forEach(function (field) {
+          var a = Zengin.rawField(origin.rec, field);
+          var b = Zengin.rawField(rec, field);
+          if (a !== b) fields.push({ field: field, before: a, after: b });
+        });
+      }
+      changed.push({
+        record: rec, index: index, kind: rec.kind, fields: fields,
+        beforeText: origin.rec.text, afterText: rec.text
+      });
+    });
+
+    var removed = [];
+    state.baseline.records.forEach(function (rec, index) {
+      if (!currentIds[rec.id]) removed.push({ record: rec, originalIndex: index, kind: rec.kind });
+    });
+
+    // 残っているレコードの並びが変わっていないか
+    var survivingBefore = state.baseline.order.filter(function (id) { return currentIds[id]; });
+    var survivingNow = doc.records
+      .filter(function (rec) { return before[rec.id]; })
+      .map(function (rec) { return rec.id; });
+    var reordered = survivingBefore.join(',') !== survivingNow.join(',');
+
+    var fieldChanges = changed.reduce(function (sum, item) {
+      return sum + (item.fields.length || 1);
+    }, 0);
+    return {
+      changed: changed, added: added, removed: removed, reordered: reordered,
+      fieldChanges: fieldChanges,
+      total: fieldChanges + added.length + removed.length + (reordered ? 1 : 0)
+    };
+  }
+
+  var MAX_DIFF_SHOWN = 200;
+
+  /** 差分ダイアログを開く。 */
+  function openDiff() {
+    renderDiff();
+    $('#diff-dialog').showModal();
+  }
+
+  function diffValue(text) {
+    return '[' + Charset.toDisplay(text) + ']';
+  }
+
+  /** 変更前後の値を、項目の性質に合わせて読みやすく表す。 */
+  function diffFieldValue(field, raw) {
+    var shown = Zengin.displayValue({ text: raw }, Object.assign({}, field, { pos: 1, end: field.len }));
+    if (field.format === 'amount' || field.format === 'count') {
+      return { text: shown === '' ? '（未入力）' : shown + (field.format === 'amount' ? ' 円' : ' 件'), raw: raw };
+    }
+    if (field.format === 'mmdd' || field.format === 'yymmdd' || field.format === 'hhmm') {
+      return { text: shown === '' ? '（未入力）' : shown, raw: raw };
+    }
+    return { text: diffValue(raw), raw: raw };
+  }
+
+  /** レコードの中身を、値の入っている項目だけで要約する。 */
+  function summarizeRecord(def, text) {
+    if (!def) return null;
+    var record = { text: text };
+    var parts = [];
+    def.fields.forEach(function (field) {
+      if (field.dummy || field.fixed != null) return;
+      var value = Zengin.readField(record, field);
+      if (value === '') return;
+      parts.push(field.label + '：' + Zengin.displayValue(record, field));
+    });
+    return parts.length ? parts.join(' / ') : null;
+  }
+
+  function renderDiff() {
+    var body = $('#diff-body');
+    var diff = computeDiff();
+
+    if (!diff.total) {
+      body.replaceChildren(h('div', { class: 'diff-empty' }, [
+        h('strong', { text: '読み込み後の変更はありません' }),
+        h('p', { class: 'field-hint', text: 'いま書き出すと、読み込んだファイルとバイト単位で同じ内容になります。' })
+      ]));
+      return;
+    }
+
+    var nodes = [h('div', { class: 'diff-summary' }, [
+      diff.fieldChanges ? h('span', { class: 'chip chip-info' }, ['変更 ' + num(diff.fieldChanges) + ' 項目（' + num(diff.changed.length) + ' レコード）']) : null,
+      diff.added.length ? h('span', { class: 'chip chip-ok' }, ['追加 ' + num(diff.added.length) + ' レコード']) : null,
+      diff.removed.length ? h('span', { class: 'chip chip-err' }, ['削除 ' + num(diff.removed.length) + ' レコード']) : null,
+      diff.reordered ? h('span', { class: 'chip chip-warn' }, ['並び順の変更あり']) : null
+    ])];
+
+    var doc = state.doc;
+    var defs = Zengin.dataDefMap(doc);
+
+    var section = function (title, items, cls, render) {
+      if (!items.length) return;
+      nodes.push(h('div', { class: 'diff-group' }, [
+        h('div', { class: 'diff-group-title', text: title + '  ' + num(items.length) + ' 件' })
+      ].concat(items.slice(0, MAX_DIFF_SHOWN).map(render),
+        items.length > MAX_DIFF_SHOWN
+          ? [h('p', { class: 'field-hint', text: 'ほか ' + num(items.length - MAX_DIFF_SHOWN) + ' 件は省略しました。' })]
+          : [])));
+    };
+
+    section('変更したレコード', diff.changed, 'is-changed', function (item) {
+      var head = h('div', { class: 'diff-item-head' }, [
+        h('span', { text: recordCaption(doc, item.kind, item.index + 1) }),
+        h('button', {
+          type: 'button', class: 'btn btn-sm', style: 'margin-left:auto',
+          onclick: function () { $('#diff-dialog').close(); jumpToRecord(item.index, item.fields[0] && item.fields[0].field.key); }
+        }, ['該当箇所へ', icon(ICON.arrow)])
+      ]);
+
+      var detail;
+      if (item.fields.length) {
+        var cells = [];
+        item.fields.forEach(function (change) {
+          var before = diffFieldValue(change.field, change.before);
+          var after = diffFieldValue(change.field, change.after);
+          cells.push(h('span', {
+            class: 'diff-name',
+            text: change.field.label,
+            title: change.field.pos + '-' + change.field.end + ' 桁'
+          }));
+          cells.push(h('span', {
+            class: 'diff-before', text: before.text, title: '原文: ' + diffValue(before.raw)
+          }));
+          cells.push(h('span', { class: 'diff-arrow', text: '→' }));
+          cells.push(h('span', {
+            class: 'diff-after', text: after.text, title: '原文: ' + diffValue(after.raw)
+          }));
+        });
+        detail = h('div', { class: 'diff-fields' }, cells);
+      } else {
+        detail = h('div', { class: 'diff-raw' }, [
+          h('div', { class: 'diff-before', text: diffValue(item.beforeText) }),
+          h('div', { class: 'diff-after', text: diffValue(item.afterText) })
+        ]);
+      }
+      return h('div', { class: 'diff-item is-changed' }, [head, detail]);
+    });
+
+    var defFor = function (kind, id) {
+      if (kind !== 'data') return doc.format.records[kind];
+      return (id && defs[id]) || doc.format.records.data;
+    };
+
+    section('追加したレコード', diff.added, 'is-added', function (item) {
+      var summary = summarizeRecord(defFor(item.kind, item.record.id), item.record.text);
+      return h('div', { class: 'diff-item is-added' }, [
+        h('div', { class: 'diff-item-head' }, [
+          h('span', { text: recordCaption(doc, item.kind, item.index + 1) }),
+          h('span', { class: 'chip chip-ok', style: 'margin-left:auto' }, ['追加'])
+        ]),
+        h('div', { class: 'diff-raw', text: summary || '（まだ何も入力されていません）' })
+      ]);
+    });
+
+    section('削除したレコード', diff.removed, 'is-removed', function (item) {
+      var summary = summarizeRecord(defFor(item.kind, item.record.id), item.record.text);
+      return h('div', { class: 'diff-item is-removed' }, [
+        h('div', { class: 'diff-item-head' }, [
+          h('span', { text: '読み込み時の第 ' + (item.originalIndex + 1) + ' レコード（' +
+            (doc.format.records[item.kind] ? doc.format.records[item.kind].label : 'レコード') + '）' }),
+          h('span', { class: 'chip chip-err', style: 'margin-left:auto' }, ['削除'])
+        ]),
+        h('div', { class: 'diff-raw', text: summary || diffValue(item.record.text) })
+      ]);
+    });
+
+    if (diff.reordered) {
+      nodes.push(h('div', { class: 'diff-group' }, [
+        h('div', { class: 'diff-group-title', text: '並び順' }),
+        h('div', { class: 'diff-item' }, [
+          h('div', { class: 'diff-raw', text: 'レコードの並び順が読み込み時から変わっています。' })
+        ])
+      ]));
+    }
+
+    body.replaceChildren.apply(body, nodes);
+    body.scrollTop = 0;
   }
 
   /* ================================================================
@@ -439,7 +694,12 @@
     var children = [];
 
     if (state.dirty) {
-      children.push(h('span', { class: 'chip chip-info' }, [icon(ICON.copy), '編集あり（未保存）']));
+      var diffCount = computeDiff().total;
+      children.push(h('button', {
+        type: 'button', class: 'chip chip-info', id: 'btn-show-diff',
+        title: '読み込み後に変更した内容を一覧で確認します',
+        onclick: openDiff
+      }, [icon(ICON.copy), '変更 ' + num(diffCount) + ' 件（未保存）']));
     }
     children.push(h('div', { class: 'stat' }, [
       h('span', { class: 'stat-label', text: 'データ件数' }),
@@ -508,6 +768,121 @@
     ]);
   }
 
+  /** 危険度の高い状態を、概要の先頭で知らせる。 */
+  function buildBlockingNotices() {
+    var doc = state.doc;
+    var cards = [];
+
+    if (Zengin.usesEbcdic(doc)) {
+      cards.push(h('div', { class: 'notice-card is-danger' }, [
+        h('span', { class: 'notice-icon' }, [svg(ICON.alert)]),
+        h('div', { class: 'notice-body' }, [
+          h('strong', { text: 'コード区分が「1：EBCDIC」です。本ツールは EBCDIC に対応していません' }),
+          h('p', {
+            text: '本ツールの文字コード処理は JIS（Shift_JIS の 1 バイト領域）と UTF-8 だけです。' +
+              'EBCDIC のファイルを JIS として読むと画面は文字化けし、書き出したファイルは壊れます。'
+          }),
+          h('p', {
+            text: '誤った内容のファイルを作らないため、書き出しを止めています。' +
+              '「生データ」タブで原文を確認するか、JIS のファイルを入手してください。'
+          })
+        ])
+      ]));
+    }
+
+    if (Zengin.hasMixedVariants(doc)) {
+      var list = Zengin.groups(doc);
+      cards.push(h('div', { class: 'notice-card' }, [
+        h('span', { class: 'notice-icon' }, [svg(ICON.info)]),
+        h('div', { class: 'notice-body' }, [
+          h('strong', { text: 'データ・レコードのレイアウトが口座ごとに異なるファイルです' }),
+          h('p', {
+            text: list.map(function (g) {
+              return (g.index + 1) + ' 組目: ' + (g.variantLabel || g.variantKey || '既定');
+            }).join(' / ') + '。検証と集計は口座ごとに正しいレイアウトで行っています。'
+          }),
+          h('p', { text: '「データ明細」タブでは、口座を選んでご覧ください。' }),
+          h('button', {
+            type: 'button', class: 'btn btn-sm',
+            onclick: function () { setTab('data'); }
+          }, ['データ明細へ', icon(ICON.arrow)])
+        ])
+      ]));
+    }
+    return cards;
+  }
+
+  /** 預金口座振替の処理結果を、結果コード別に集計して見せる。 */
+  function buildResultBreakdown(dataRecords) {
+    var doc = state.doc;
+    var def = currentDataDef();
+    var resultField = Zengin.fieldByRole(def, 'resultCode');
+    if (!resultField || !dataRecords.length) return null;
+
+    var hasResult = dataRecords.some(function (rec) {
+      var code = Zengin.readField(rec, resultField).trim();
+      return code !== '' && code !== '0';
+    });
+    var trailerDef = doc.format.records.trailer;
+    ['doneCount', 'doneAmount', 'failCount', 'failAmount'].forEach(function (key) {
+      var field = trailerDef.byKey[key];
+      if (!field) return;
+      Zengin.recordsOfKind(doc, 'trailer').forEach(function (rec) {
+        if (Zengin.toNumber(Zengin.readField(rec, field)) !== 0) hasResult = true;
+      });
+    });
+    if (!hasResult) return null;
+
+    var buckets = Object.create(null);
+    var total = 0;
+    dataRecords.forEach(function (rec) {
+      var code = Zengin.readField(rec, resultField).trim() || '0';
+      var amount = Zengin.amountOf(def, rec);
+      if (!buckets[code]) buckets[code] = { code: code, count: 0, amount: 0 };
+      buckets[code].count++;
+      buckets[code].amount += amount;
+      total += amount;
+    });
+
+    var rows = Object.keys(buckets).sort().map(function (k) { return buckets[k]; });
+    var body = h('tbody', null, rows.map(function (row) {
+      var label = Zengin.codeLabel(resultField, row.code) || '（定義外）';
+      var ok = row.code === '0';
+      return h('tr', null, [
+        h('td', { class: 'cell', style: 'padding:6px 12px' }, [
+          h('span', { class: 'chip ' + (ok ? 'chip-ok' : 'chip-warn'), style: 'height:21px;font-size:11px' },
+            [row.code + '：' + label])
+        ]),
+        h('td', { class: 'cell is-num', style: 'padding:6px 12px', text: num(row.count) }),
+        h('td', { class: 'cell is-num', style: 'padding:6px 12px', text: num(row.amount) }),
+        h('td', {
+          class: 'cell is-num', style: 'padding:6px 12px;color:var(--text-2)',
+          text: total ? (Math.round((row.amount / total) * 1000) / 10) + '%' : '—'
+        })
+      ]);
+    }));
+
+    return h('div', { class: 'card' }, [
+      h('div', { class: 'card-head' }, [
+        h('h2', { text: '振替結果コード別の内訳' }),
+        h('span', { class: 'card-note', text: '処理結果明細として集計しています' })
+      ]),
+      h('div', { class: 'card-body is-tight' }, [
+        h('div', { style: 'overflow:auto' }, [
+          h('table', { class: 'ztable', style: 'width:100%' }, [
+            h('thead', null, [h('tr', null, [
+              h('th', { text: '結果' }),
+              h('th', { style: 'text-align:right', text: '件数' }),
+              h('th', { style: 'text-align:right', text: '金額（円）' }),
+              h('th', { style: 'text-align:right', text: '構成比' })
+            ])]),
+            body
+          ])
+        ])
+      ])
+    ]);
+  }
+
   function kpi(label, value, unit, sub, accent) {
     return h('div', { class: 'kpi' + (accent ? ' kpi-accent' : '') }, [
       h('div', { class: 'kpi-label', text: label }),
@@ -536,7 +911,7 @@
     var maxAmount = amounts.length ? Math.max.apply(null, amounts) : 0;
     var avgAmount = amounts.length ? Math.round(summary.amount / amounts.length) : 0;
 
-    var nodes = [];
+    var nodes = buildBlockingNotices();
     var pending = buildLayoutPendingNotice();
     if (pending) nodes.push(pending);
 
@@ -603,6 +978,10 @@
 
     grid.push(renderFileSettings());
     nodes.push(h('div', { class: 'summary-grid' }, grid));
+
+    /* --- 振替結果コード別の内訳 --- */
+    var breakdown = buildResultBreakdown(dataRecords);
+    if (breakdown) nodes.push(breakdown);
 
     /* --- 被仕向金融機関別の内訳 --- */
     if (!format.generic && dataRecords.length) {
@@ -1008,6 +1387,20 @@
      データ明細タブ
      ================================================================ */
 
+  /**
+   * いま「データ明細」タブで扱っているデータ・レコード定義。
+   *
+   * 入出金取引明細のように口座ごとにレイアウトが変わるファイルでは、
+   * 選択中の口座の定義を使う。口座を選んでいない場合は先頭の組に合わせる。
+   */
+  function currentDataDef() {
+    var doc = state.doc;
+    var list = Zengin.groups(doc);
+    if (state.groupIndex != null && list[state.groupIndex]) return list[state.groupIndex].dataDef;
+    if (list.length && Zengin.hasMixedVariants(doc)) return list[0].dataDef;
+    return doc.format.records.data;
+  }
+
   /** 表示対象の行（ファイル内の並び順つき）。グループを選んでいれば絞り込む。 */
   function dataRows() {
     var rows = [];
@@ -1021,13 +1414,28 @@
         group.data.forEach(function (rec) { scope[rec.id] = true; });
       }
     }
+    // レイアウトが口座ごとに異なるファイルでは、表示中の定義に合う行だけを扱う
+    var def = currentDataDef();
+    var defs = Zengin.hasMixedVariants(state.doc) ? Zengin.dataDefMap(state.doc) : null;
+
     state.doc.records.forEach(function (rec, index) {
       if (rec.kind !== 'data') return;
       no++;
       if (scope && !scope[rec.id]) return;
+      if (defs && (defs[rec.id] || def) !== def) return;
       rows.push({ rec: rec, no: no, index: index });
     });
     return rows;
+  }
+
+  /** レイアウト混在時に、いま表示できていないデータレコードの件数。 */
+  function hiddenByLayoutCount() {
+    if (!Zengin.hasMixedVariants(state.doc)) return 0;
+    var def = currentDataDef();
+    var defs = Zengin.dataDefMap(state.doc);
+    return Zengin.recordsOfKind(state.doc, 'data').filter(function (rec) {
+      return (defs[rec.id] || def) !== def;
+    }).length;
   }
 
   function filteredRows() {
@@ -1040,7 +1448,7 @@
       });
     }
     if (state.sortKey) {
-      var field = state.doc.format.records.data.byKey[state.sortKey];
+      var field = currentDataDef().byKey[state.sortKey];
       if (field) {
         var dir = state.sortDir;
         rows = rows.slice().sort(function (a, b) {
@@ -1057,7 +1465,7 @@
   }
 
   function visibleColumns() {
-    return state.doc.format.records.data.fields.filter(function (field) {
+    return currentDataDef().fields.filter(function (field) {
       return state.showDummy || !field.hideInTable;
     });
   }
@@ -1074,6 +1482,18 @@
     var pageRows = rows.slice(start, start + state.pageSize);
 
     var children = [buildDataToolbar()];
+    var hidden = hiddenByLayoutCount();
+    if (hidden) {
+      children.push(h('div', { style: 'padding: 14px 16px 0' }, [
+        h('div', { class: 'notice-card' }, [
+          h('span', { class: 'notice-icon' }, [svg(ICON.info)]),
+          h('div', { class: 'notice-body' }, [
+            h('strong', { text: '別のレイアウトのデータ・レコードが ' + num(hidden) + ' 件あります' }),
+            h('p', { text: '口座によってデータ・レコードの項目が異なるため、同じ表には並べられません。上の口座選択で切り替えてご覧ください。' })
+          ])
+        ])
+      ]));
+    }
     var pending = buildLayoutPendingNotice();
     if (pending) {
       children.push(h('div', { style: 'padding: 14px 16px 0' }, [pending]));
@@ -1395,7 +1815,7 @@
   function beginEdit(td, initialChar) {
     if (td.querySelector('.cell-editor')) return;
     var record = findRecordById(td.dataset.rec);
-    var field = state.doc.format.records.data.byKey[td.dataset.field];
+    var field = currentDataDef().byKey[td.dataset.field];
     if (!record || !field) return;
 
     var original = Zengin.readField(record, field);
@@ -1482,7 +1902,7 @@
     if (key === 'Delete' || key === 'Backspace') {
       event.preventDefault();
       var record = findRecordById(td.dataset.rec);
-      var field = state.doc.format.records.data.byKey[td.dataset.field];
+      var field = currentDataDef().byKey[td.dataset.field];
       if (record && field) {
         Zengin.setField(record, field, '');
         markDirty();
@@ -1658,7 +2078,7 @@
       counts.error ? h('span', { class: 'chip chip-err' }, [icon(ICON.alert), 'エラー ' + counts.error + ' 件']) : null,
       counts.warn ? h('span', { class: 'chip chip-warn' }, [icon(ICON.alert), '警告 ' + counts.warn + ' 件']) : null,
       counts.info ? h('span', { class: 'chip chip-info' }, [icon(ICON.info), '情報 ' + counts.info + ' 件']) : null
-    ])];
+    ].concat(buildRepairActions(issues)))];
 
     ['error', 'warn', 'info'].forEach(function (level) {
       var list = issues.filter(function (it) { return it.level === level; });
@@ -1674,6 +2094,40 @@
     });
 
     panel.replaceChildren.apply(panel, nodes);
+  }
+
+  /** その場で直せる問題に、修正操作を添える。 */
+  function buildRepairActions(issues) {
+    var actions = [];
+    var hasTotals = issues.some(function (it) {
+      return it.hint && it.hint.indexOf('合計を再計算') >= 0;
+    });
+    if (hasTotals) {
+      actions.push(h('button', {
+        type: 'button', class: 'btn btn-sm btn-primary', onclick: doRecalc
+      }, [icon(ICON.refresh), '合計を再計算']));
+    }
+    var hasShort = issues.some(function (it) {
+      return it.hint && it.hint.indexOf('レコード長をそろえる') >= 0;
+    });
+    if (hasShort) {
+      actions.push(h('button', {
+        type: 'button', class: 'btn btn-sm', id: 'btn-normalize-length', onclick: doNormalizeLengths
+      }, [icon(ICON.check), 'レコード長をそろえる']));
+    }
+    return actions;
+  }
+
+  function doNormalizeLengths() {
+    var fixed = Zengin.normalizeRecordLengths(state.doc);
+    if (!fixed) {
+      toast('補うレコードはありませんでした', null, 'info');
+      return;
+    }
+    markDirty();
+    renderAll();
+    toast('レコード長をそろえました',
+      num(fixed) + ' 件のレコードの末尾を空白で補いました。', 'ok');
   }
 
   function buildIssueItem(item, level) {
@@ -1733,7 +2187,17 @@
     return name.replace(/\.[^.]+$/, '');
   }
 
+  /** EBCDIC 宣言のファイルは、正しい形で書き出せないため止める。 */
+  function blockedByEbcdic() {
+    if (!Zengin.usesEbcdic(state.doc)) return false;
+    toast('EBCDIC のファイルは書き出せません',
+      '本ツールは EBCDIC の変換に対応していません。誤った内容のファイルを作らないため、書き出しを止めました。', 'error');
+    setTab('issues');
+    return true;
+  }
+
   function exportZengin() {
+    if (blockedByEbcdic()) return;
     var doc = state.doc;
     var summary = Zengin.summarize(doc);
     confirmExport({
@@ -1756,6 +2220,7 @@
   }
 
   function exportCsv() {
+    if (blockedByEbcdic()) return;
     var doc = state.doc;
     confirmExport({
       meta: [
@@ -1972,6 +2437,7 @@
     $('#btn-theme').addEventListener('click', function () {
       applyTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark');
     });
+    $('#diff-close').addEventListener('click', function () { $('#diff-dialog').close(); });
     $('#btn-save-zengin').addEventListener('click', requireDoc(exportZengin));
     $('#btn-save-csv').addEventListener('click', requireDoc(exportCsv));
 

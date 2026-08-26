@@ -212,6 +212,20 @@
   </div>
 </dialog>
 
+<dialog class="dialog dialog-diff" id="diff-dialog" aria-labelledby="diff-title">
+  <form method="dialog" class="dialog-head">
+    <h2 id="diff-title">読み込み後の変更内容</h2>
+    <button type="submit" class="btn btn-icon" aria-label="閉じる">
+      <svg viewBox="0 0 24 24" class="icon" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+    </button>
+  </form>
+  <div class="diff-body" id="diff-body"></div>
+  <div class="dialog-actions">
+    <span class="field-hint" style="margin-right:auto">この一覧はブラウザ内でのみ保持され、どこにも送信・保存されません。</span>
+    <button type="button" class="btn" id="diff-close">閉じる</button>
+  </div>
+</dialog>
+
 <dialog class="dialog dialog-export" id="export-dialog" aria-labelledby="export-title">
   <div class="export-head">
     <span class="disclaimer-icon" aria-hidden="true">

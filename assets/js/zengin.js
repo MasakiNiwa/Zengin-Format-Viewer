@@ -222,13 +222,17 @@
     var codec = Charset.getCodec(encoding);
     var text = codec.decode(bytes);
 
-    // BOM 除去
-    if (text.charCodeAt(0) === 0xfeff) {
-      text = text.slice(1);
-      notices.push({ level: 'info', message: 'UTF-8 BOM を検出し、読み飛ばしました。' });
+    // BOM は取り除いて解析するが、書き出しでそのまま復元できるよう覚えておく。
+    // TextDecoder は UTF-8 BOM を自動で取り除くため、判定はバイト列に対して行う。
+    var hasBom = bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf;
+    if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+    if (hasBom) {
+      notices.push({ level: 'info', message: 'UTF-8 BOM を検出しました。書き出し時も同じ位置に付けます。' });
     }
 
     var lineEnding = detectLineEnding(text);
+    // 末尾の改行の有無も、読み込んだファイルと同じ形で書き戻すために覚えておく
+    var trailingNewline = lineEnding !== 'NONE' && /(\r\n|\r|\n)$/.test(text);
     var lines;
     var recordLength;
 
@@ -305,32 +309,10 @@
       });
     }
 
-    var shortLines = 0;
-    var longLines = 0;
+    // 読み込んだ内容には手を加えない。桁数の過不足は検証で指摘する。
     var records = lines.map(function (line) {
-      var kind = KIND_BY_KUBUN[line.charAt(0)] || 'unknown';
-      if (line.length < recordLength) {
-        shortLines++;
-        line = padRight(line, recordLength, ' ');
-      } else if (line.length > recordLength) {
-        longLines++;
-      }
-      return makeRecord(line, kind);
+      return makeRecord(line, KIND_BY_KUBUN[line.charAt(0)] || 'unknown');
     });
-    if (shortLines) {
-      notices.push({
-        level: 'info',
-        message: recordLength + ' 桁に満たないレコードが ' + shortLines +
-          ' 件あったため、末尾を空白で補いました。'
-      });
-    }
-    if (longLines) {
-      notices.push({
-        level: 'warn',
-        message: recordLength + ' 桁を超えるレコードが ' + longLines +
-          ' 件あります。内容はそのまま保持しています。'
-      });
-    }
 
     return {
       fileName: opts.fileName || '',
@@ -344,6 +326,8 @@
       records: records,
       notices: notices,
       variantKey: format.variantKey || null,
+      hasBom: hasBom,
+      trailingNewline: trailingNewline,
       byteLength: bytes.length
     };
   }
@@ -379,6 +363,8 @@
         blankRecord(format, 'end')
       ],
       notices: [],
+      hasBom: false,
+      trailingNewline: true,
       byteLength: 0
     };
     return doc;
@@ -395,19 +381,41 @@
    * @param {object} doc
    * @param {{encoding?:string, lineEnding?:string}} [options]
    */
+  /**
+   * 文書を全銀固定長のバイト列へ書き出す。
+   *
+   * レコードの内容には手を加えない（桁揃えも切り詰めもしない）。
+   * 編集していない文書なら、読み込んだファイルとバイト単位で一致する。
+   * 桁数が規定と違うレコードは、検証で指摘したうえで原文のまま出力する。
+   */
   function serialize(doc, options) {
     var opts = options || {};
     var encoding = opts.encoding || doc.encoding || 'shift_jis';
     var lineEnding = opts.lineEnding || doc.lineEnding || 'CRLF';
     var eol = LINE_ENDINGS[lineEnding] != null ? LINE_ENDINGS[lineEnding] : '\r\n';
-    var len = doc.recordLength || doc.format.recordLength;
 
-    var text = doc.records.map(function (rec) {
-      return padRight(rec.text, len, ' ').slice(0, len);
-    }).join(eol);
-    if (eol && doc.records.length) text += eol;
+    var text = doc.records.map(function (rec) { return rec.text; }).join(eol);
+    var trailing = opts.trailingNewline != null ? opts.trailingNewline : doc.trailingNewline;
+    if (eol && doc.records.length && trailing !== false) text += eol;
+    if (doc.hasBom) text = '\uFEFF' + text;
 
     return Charset.getCodec(encoding).encode(text);
+  }
+
+  /**
+   * 桁数が規定に満たないレコードを、末尾の空白で整える。
+   * 読み込み時には行わず、利用者が明示的に選んだときだけ実行する。
+   */
+  function normalizeRecordLengths(doc) {
+    var len = doc.recordLength || doc.format.recordLength;
+    var fixed = 0;
+    doc.records.forEach(function (rec) {
+      if (rec.text.length < len) {
+        rec.text = padRight(rec.text, len, ' ');
+        fixed++;
+      }
+    });
+    return fixed;
   }
 
   /* ------------------------------------------------------------------ *
@@ -451,6 +459,36 @@
    * （残高通知や入出金取引明細では口座ごとにグループが並ぶ）。
    * 合計件数・合計金額はグループ単位で突き合わせる必要がある。
    */
+  /**
+   * グループのヘッダーから、そのグループのデータ・レコード定義を決める。
+   *
+   * 入出金取引明細のように、口座の預金種目でデータ・レコードのレイアウトが
+   * 変わるフォーマットでは、口座ごと（ヘッダーごと）に判定する必要がある。
+   */
+  function resolveGroupData(doc, group) {
+    var format = doc.format;
+    if (!format.variants || !format.selectVariant) {
+      return { key: format.variantKey || null, def: format.records.data };
+    }
+    if (!group.header) {
+      return { key: doc.variantKey || format.variantKey, def: format.records.data };
+    }
+    var headerDef = format.records.header;
+    var key = format.selectVariant({
+      headerValue: function (fieldKey) {
+        var field = headerDef.byKey[fieldKey];
+        return field ? readField(group.header, field) : '';
+      },
+      dataSamples: group.data.map(function (rec) { return rec.text; }).slice(0, 20)
+    });
+    for (var i = 0; i < format.variants.length; i++) {
+      if (format.variants[i].key === key) {
+        return { key: key, def: format.variants[i].data, label: format.variants[i].label };
+      }
+    }
+    return { key: format.variantKey || null, def: format.records.data };
+  }
+
   function groups(doc) {
     var result = [];
     var current = null;
@@ -474,7 +512,45 @@
         current = null; // トレーラでグループを閉じる
       }
     });
+    result.forEach(function (group) {
+      var resolved = resolveGroupData(doc, group);
+      group.variantKey = resolved.key;
+      group.variantLabel = resolved.label || null;
+      group.dataDef = resolved.def;
+    });
     return result;
+  }
+
+  /** レコード ID から、そのレコードに使うデータ・レコード定義を引ける表を作る。 */
+  function dataDefMap(doc) {
+    var map = Object.create(null);
+    groups(doc).forEach(function (group) {
+      group.data.forEach(function (rec) { map[rec.id] = group.dataDef; });
+    });
+    return map;
+  }
+
+  /** グループごとにレイアウトが分かれているか。 */
+  function hasMixedVariants(doc) {
+    var list = groups(doc);
+    if (list.length < 2) return false;
+    var first = list[0].variantKey;
+    return list.some(function (g) { return g.variantKey !== first; });
+  }
+
+  /**
+   * ヘッダーのコード区分が EBCDIC（1）になっているか。
+   *
+   * 本ツールの文字コード処理は JIS（Shift_JIS の 1 バイト領域）と UTF-8 だけで、
+   * EBCDIC の変換は持っていない。EBCDIC と宣言されたファイルを JIS として
+   * 読み書きすると、画面上は文字化けし、書き出したファイルは壊れる。
+   */
+  function usesEbcdic(doc) {
+    var field = doc.format.records.header.byKey.codeKubun;
+    if (!field) return false;
+    return recordsOfKind(doc, 'header').some(function (rec) {
+      return readField(rec, field).trim() === '1';
+    });
   }
 
   /** グループを人が読める見出しにする（口座単位の切り替え用）。 */
@@ -506,9 +582,10 @@
   function summarize(doc) {
     var dataDef = doc.format.records.data;
     var amountFields = fieldsByRole(dataDef, 'amount');
+    var defs = dataDefMap(doc);
     var rows = recordsOfKind(doc, 'data');
     var total = 0;
-    rows.forEach(function (rec) { total += amountOf(dataDef, rec); });
+    rows.forEach(function (rec) { total += amountOf(defs[rec.id] || dataDef, rec); });
     return {
       count: rows.length, amount: total,
       amountField: amountFields[0] || null, amountFields: amountFields
@@ -533,8 +610,8 @@
   }
 
   /** 与えられたデータレコード群を、集計仕様にしたがって集計する。 */
-  function computeAggregates(doc, dataRecords) {
-    var dataDef = doc.format.records.data;
+  function computeAggregates(doc, dataRecords, dataDefOverride) {
+    var dataDef = dataDefOverride || doc.format.records.data;
     var hasAmountField = fieldsByRole(dataDef, 'amount').length > 0;
     return aggregateSpecs(doc.format).map(function (spec) {
       var rows = dataRecords;
@@ -561,7 +638,7 @@
     var amount = 0;
     groups(doc).forEach(function (group) {
       if (!group.trailer) return;
-      computeAggregates(doc, group.data).forEach(function (agg) {
+      computeAggregates(doc, group.data, group.dataDef).forEach(function (agg) {
         var countField = agg.spec.countKey ? trailerDef.byKey[agg.spec.countKey] : null;
         var amountField = agg.spec.amountKey ? trailerDef.byKey[agg.spec.amountKey] : null;
         if (countField) setField(group.trailer, countField, String(agg.count));
@@ -570,20 +647,43 @@
       updated++;
       count += group.data.length;
     });
+    // エンド・レコードの集計欄（口座数・レコード総件数）
+    var endDef = doc.format.records.end;
+    var accountField = fieldByRole(endDef, 'accountTotal');
+    var recordTotalField = fieldByRole(endDef, 'recordTotal');
+    var endRecords = recordsOfKind(doc, 'end');
+    var headerGroups = groups(doc).filter(function (g) { return g.header; }).length;
+    endRecords.forEach(function (rec) {
+      if (accountField) setField(rec, accountField, String(headerGroups));
+      if (recordTotalField) {
+        // エンド・レコード自身を数に含めるかは規定書に明記がないため、
+        // 元のファイルが採っていた数え方をそのまま残す
+        var current = toNumber(readField(rec, recordTotalField));
+        var withoutEnd = doc.records.length - endRecords.length;
+        setField(rec, recordTotalField,
+          String(current === withoutEnd ? withoutEnd : doc.records.length));
+      }
+    });
+
     var sum = summarize(doc);
     amount = sum.amount;
-    return { updated: updated, count: count, amount: amount };
+    return { updated: updated, count: count, amount: amount, endRecords: endRecords.length };
   }
 
   /* ------------------------------------------------------------------ *
    * 検証
    * ------------------------------------------------------------------ */
 
-  /** 月日として妥当か（実在日までは判定しない）。 */
+  // 月ごとの最大日数。2 月は閏年を区別できないため 29 日まで許容する
+  // （YYMMDD の YY は和暦のため、西暦の年を確定できない）。
+  var MAX_DAY_OF_MONTH = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+  /** 月日として妥当か。 */
   function validMonthDay(mm, dd) {
     var m = parseInt(mm, 10);
     var d = parseInt(dd, 10);
-    return m >= 1 && m <= 12 && d >= 1 && d <= 31;
+    if (!(m >= 1 && m <= 12)) return false;
+    return d >= 1 && d <= MAX_DAY_OF_MONTH[m - 1];
   }
 
   function issue(level, message, extra) {
@@ -610,6 +710,8 @@
       return issues;
     }
 
+    var dataDefs = dataDefMap(doc);
+
     // --- レコード単位のチェック -------------------------------------
     doc.records.forEach(function (rec, index) {
       if (issues.length >= MAX_ISSUES) { truncated = true; return; }
@@ -618,9 +720,15 @@
           { recordIndex: index, hint: '先頭 1 桁を正しいデータ区分に修正してください。' }));
         return;
       }
-      if (rec.text.length !== len) {
-        issues.push(issue('error', 'レコード長が ' + rec.text.length + ' 桁です（正しくは ' + len + ' 桁）。',
-          { recordIndex: index }));
+      if (rec.text.length < len) {
+        issues.push(issue('warn', 'レコード長が ' + rec.text.length + ' 桁です（規定は ' + len + ' 桁）。',
+          {
+            recordIndex: index,
+            hint: '末尾の空白が削られたファイルでよく見られます。「レコード長をそろえる」で補えます。'
+          }));
+      } else if (rec.text.length > len) {
+        issues.push(issue('error', 'レコード長が ' + rec.text.length + ' 桁です（規定は ' + len + ' 桁）。',
+          { recordIndex: index, hint: '規定の桁数を超えた部分は、生データタブで確認できます。' }));
       }
 
       var tolerated = Charset.findToleratedChars(rec.text);
@@ -643,7 +751,7 @@
         }));
       }
 
-      var def = format.records[rec.kind];
+      var def = rec.kind === 'data' ? (dataDefs[rec.id] || format.records.data) : format.records[rec.kind];
       if (!def) return;
       def.fields.forEach(function (field) {
         var raw = rawField(rec, field);
@@ -654,9 +762,28 @@
             '」である必要があります（現在: 「' + raw.trim() + '」）。',
           { recordIndex: index, fieldKey: field.key }));
         }
-        if (field.type === 'N' && !field.dummy && /[^\d\s]/.test(raw)) {
-          issues.push(issue('error', def.label + 'の「' + field.label + '」は数字項目ですが、数字以外が含まれています。',
-            { recordIndex: index, fieldKey: field.key, hint: '現在の値: 「' + raw + '」' }));
+        if (field.type === 'N' && !field.dummy) {
+          if (/[^\d\s]/.test(raw)) {
+            issues.push(issue('error', def.label + 'の「' + field.label + '」は数字項目ですが、数字以外が含まれています。',
+              { recordIndex: index, fieldKey: field.key, hint: '現在の値: 「' + raw + '」' }));
+          } else if (/\d/.test(raw) && /\s/.test(raw)) {
+            // 数字項目は右詰めで残りを「0」で埋める規定のため、
+            // 数字と空白が混ざった状態は桁の取り違えを招く
+            issues.push(issue('error', def.label + 'の「' + field.label + '」に数字と空白が混在しています。',
+              {
+                recordIndex: index, fieldKey: field.key,
+                hint: '数字項目は右詰めで、残りを「0」で埋めます。現在の値: 「' + raw + '」'
+              }));
+          }
+        }
+        // 規定書が埋め文字を定めているダミー領域
+        if (field.fill && raw !== new Array(field.len + 1).join(field.fill)) {
+          issues.push(issue('warn', def.label + 'の「' + field.label + '」（' + field.pos + '-' + field.end +
+            ' 桁）は、規定では' + (field.fill === ' ' ? 'すべて空白' : 'すべて「0」') + 'です。',
+          {
+            recordIndex: index, fieldKey: field.key,
+            hint: '金融機関が独自に使用している場合もあります。現在の値: 「' + raw + '」'
+          }));
         }
         if (field.required && value === '') {
           issues.push(issue('error', def.label + 'の必須項目「' + field.label + '」が未入力です。',
@@ -756,28 +883,18 @@
 
     var groupList = groups(doc);
 
-    // データ・レコードのレイアウトがグループごとに変わる場合の注意
-    if (format.variants && format.selectVariant && doc.variantKey) {
-      var headerDef2 = format.records.header;
-      groupList.forEach(function (group) {
-        if (!group.header) return;
-        var resolved = format.selectVariant({
-          headerValue: function (key) {
-            var field = headerDef2.byKey[key];
-            return field ? readField(group.header, field) : '';
-          },
-          dataSamples: group.data.map(function (r) { return r.text; }).slice(0, 20)
-        });
-        if (resolved !== doc.variantKey) {
-          issues.push(issue('warn', (group.index + 1) + ' 組目は、ファイル全体とは別のレイアウト' +
-            '（' + resolved + '）が想定されるレコードです。',
-          {
-            recordIndex: group.headerIndex,
-            hint: 'このグループの項目は正しく解釈できていない可能性があります。' +
-              '「生データ」タブで桁位置をご確認ください。'
-          }));
-        }
-      });
+    // データ・レコードのレイアウトがグループごとに変わる場合の案内
+    if (format.variants && groupList.length > 1) {
+      var firstKey = groupList[0].variantKey;
+      var mixed = groupList.filter(function (g) { return g.variantKey !== firstKey; });
+      if (mixed.length) {
+        issues.push(issue('info', 'このファイルには、データ・レコードのレイアウトが異なる口座が' +
+          '含まれています（' + groupList.length + ' 組中 ' + mixed.length + ' 組）。',
+        {
+          hint: '口座ごとに正しいレイアウトで解釈しています。' +
+            '「データ明細」タブでは口座を選んで表示してください。'
+        }));
+      }
     }
 
     groupList.forEach(function (group) {
@@ -809,7 +926,7 @@
     groupList.forEach(function (group) {
       if (!group.trailer) return;
       var recIndex = group.trailerIndex;
-      computeAggregates(doc, group.data).forEach(function (agg) {
+      computeAggregates(doc, group.data, group.dataDef).forEach(function (agg) {
         var countField = agg.spec.countKey ? trailerDef.byKey[agg.spec.countKey] : null;
         var amountField = agg.spec.amountKey ? trailerDef.byKey[agg.spec.amountKey] : null;
         var prefix = groupList.length > 1 ? (group.index + 1) + ' 組目の' : '';
@@ -855,6 +972,59 @@
         ' 件で打ち切りました。まず表示されている問題を修正してから、再度読み込んでください。'));
     }
 
+    // --- コード区分（EBCDIC）---------------------------------------
+    if (usesEbcdic(doc)) {
+      issues.push(issue('error', 'ヘッダーのコード区分が「1：EBCDIC」です。本ツールは EBCDIC に対応していません。',
+        {
+          recordIndex: groupList.length ? groupList[0].headerIndex : null,
+          fieldKey: 'codeKubun',
+          hint: '画面の表示は文字化けし、書き出したファイルは正しい EBCDIC になりません。' +
+            '書き出しは行えません。JIS のファイルを入手いただくか、コード区分をご確認ください。'
+        }));
+    }
+
+    // --- エンド・レコードの集計値 -----------------------------------
+    var endDef = format.records.end;
+    var endRecords = recordsOfKind(doc, 'end');
+    var accountField = fieldByRole(endDef, 'accountTotal');
+    var recordTotalField = fieldByRole(endDef, 'recordTotal');
+    endRecords.forEach(function (rec) {
+      var recIndex = doc.records.indexOf(rec);
+      if (accountField) {
+        var declaredAccounts = toNumber(readField(rec, accountField));
+        var headerGroups = groupList.filter(function (g) { return g.header; }).length;
+        if (declaredAccounts !== headerGroups) {
+          issues.push(issue('warn', 'エンド・レコードの「' + accountField.label + '」（' +
+            formatAmount(declaredAccounts) + '）が、ヘッダー・レコードの数（' +
+            formatAmount(headerGroups) + '）と一致しません。',
+          { recordIndex: recIndex, fieldKey: accountField.key, hint: '「合計を再計算」で自動修正できます。' }));
+        }
+      }
+      if (recordTotalField) {
+        var declaredRecords = toNumber(readField(rec, recordTotalField));
+        // 規定書はエンド・レコード自身を数に含めるか明記していないため、
+        // どちらの数え方とも合わない場合にだけ指摘する
+        var withEnd = doc.records.length;
+        var withoutEnd = doc.records.length - endRecords.length;
+        if (declaredRecords !== withEnd && declaredRecords !== withoutEnd) {
+          issues.push(issue('warn', 'エンド・レコードの「' + recordTotalField.label + '」（' +
+            formatAmount(declaredRecords) + '）が、実際のレコード数（' +
+            formatAmount(withoutEnd) + ' または ' + formatAmount(withEnd) + '）と一致しません。',
+          {
+            recordIndex: recIndex, fieldKey: recordTotalField.key,
+            hint: 'エンド・レコード自身を数に含めるかは規定書に明記がないため、' +
+              'どちらの数え方でも合わない場合にお知らせしています。'
+          }));
+        }
+      }
+    });
+
+    // --- 預金口座振替の処理結果明細 --------------------------------
+    validateDebitResult(doc, groupList, issues);
+
+    // --- 重複明細（振込依頼系のみ）---------------------------------
+    validateDuplicates(doc, dataDefs, issues);
+
     // --- 文字コード -------------------------------------------------
     if (doc.encodingDetection && doc.encodingDetection.confidence === 'guess') {
       issues.push(issue('warn', '文字コードを自動判定できませんでした。' + doc.encodingDetection.reason,
@@ -862,6 +1032,121 @@
     }
 
     return issues;
+  }
+
+  /**
+   * 預金口座振替の処理結果明細を検証する。
+   *
+   * 依頼明細では振替済・振替不能の欄はすべて「0」と規定されているため、
+   * 結果が入っているファイルだけを対象にする。
+   */
+  function validateDebitResult(doc, groupList, issues) {
+    var format = doc.format;
+    var trailerDef = format.records.trailer;
+    var dataDef = format.records.data;
+    var resultField = fieldByRole(dataDef, 'resultCode');
+    var keys = ['doneCount', 'doneAmount', 'failCount', 'failAmount'];
+    if (!resultField || keys.some(function (k) { return !trailerDef.byKey[k]; })) return;
+
+    groupList.forEach(function (group) {
+      if (!group.trailer) return;
+      var recIndex = group.trailerIndex;
+      var declared = {};
+      keys.forEach(function (k) { declared[k] = toNumber(readField(group.trailer, trailerDef.byKey[k])); });
+
+      var actual = { doneCount: 0, doneAmount: 0, failCount: 0, failAmount: 0 };
+      var anyFailure = false;
+      group.data.forEach(function (rec) {
+        var code = readField(rec, resultField).trim();
+        var amount = amountOf(group.dataDef || dataDef, rec);
+        if (code === '' || code === '0') { actual.doneCount++; actual.doneAmount += amount; }
+        else { actual.failCount++; actual.failAmount += amount; anyFailure = true; }
+      });
+
+      var hasResultTotals = keys.some(function (k) { return declared[k] !== 0; });
+      if (!hasResultTotals && !anyFailure) return; // 依頼明細とみなす
+
+      keys.forEach(function (k) {
+        var field = trailerDef.byKey[k];
+        if (declared[k] === actual[k]) return;
+        var unit = k.indexOf('Amount') >= 0 ? ' 円' : ' 件';
+        issues.push(issue('warn', 'トレーラの「' + field.label + '」（' + formatAmount(declared[k]) + unit +
+          '）が、振替結果コードから求めた値（' + formatAmount(actual[k]) + unit + '）と一致しません。',
+        {
+          recordIndex: recIndex, fieldKey: field.key,
+          hint: '振替結果コードが「0：振替済」のものを振替済、それ以外を振替不能として集計しています。'
+        }));
+      });
+
+      var totalAmountField = trailerDef.byKey.totalAmount;
+      if (totalAmountField) {
+        var totalDeclared = toNumber(readField(group.trailer, totalAmountField));
+        var sum = declared.doneAmount + declared.failAmount;
+        if (sum !== totalDeclared) {
+          issues.push(issue('warn', '振替済金額（' + formatAmount(declared.doneAmount) +
+            ' 円）と振替不能金額（' + formatAmount(declared.failAmount) +
+            ' 円）の合計が、合計金額（' + formatAmount(totalDeclared) + ' 円）と一致しません。',
+          { recordIndex: recIndex, fieldKey: totalAmountField.key }));
+        }
+      }
+    });
+  }
+
+  /**
+   * 同じ振込先へ同じ金額の明細が複数ないか調べる。
+   *
+   * 重複が誤りとは限らない（同一取引先への複数支払は普通にある）ため、
+   * エラーではなく確認を促す警告として報告する。
+   * 入金明細や残高通知に同じ考え方を当てると正常な取引まで大量に指摘するため、
+   * 銀行へ提出する振込依頼系のフォーマットだけを対象にする。
+   */
+  function validateDuplicates(doc, dataDefs, issues) {
+    var format = doc.format;
+    if (format.direction !== 'submit' || !format.duplicateKeys) return;
+    var dataDef = format.records.data;
+    var keyFields = format.duplicateKeys.map(function (k) { return dataDef.byKey[k]; });
+    if (keyFields.some(function (fd) { return !fd; })) return;
+
+    var byAccount = Object.create(null);
+    var no = 0;
+    doc.records.forEach(function (rec, index) {
+      if (rec.kind !== 'data') return;
+      no++;
+      var def = dataDefs[rec.id] || dataDef;
+      var account = keyFields.map(function (fd) { return readField(rec, fd); }).join('\u0001');
+      var amount = amountOf(def, rec);
+      if (!byAccount[account]) byAccount[account] = [];
+      byAccount[account].push({ no: no, index: index, amount: amount });
+    });
+
+    Object.keys(byAccount).forEach(function (account) {
+      var rows = byAccount[account];
+      if (rows.length < 2) return;
+
+      var byAmount = Object.create(null);
+      rows.forEach(function (row) {
+        var key = String(row.amount);
+        (byAmount[key] = byAmount[key] || []).push(row);
+      });
+
+      var exact = Object.keys(byAmount).filter(function (k) { return byAmount[k].length > 1; });
+      if (exact.length) {
+        exact.forEach(function (key) {
+          var group = byAmount[key];
+          issues.push(issue('warn', '同じ口座・同じ金額（' + formatAmount(group[0].amount) +
+            ' 円）の明細が ' + group.length + ' 件あります（' +
+            group.map(function (r) { return r.no + ' 行目'; }).join('、') + '）。',
+          {
+            recordIndex: group[0].index,
+            hint: '二重振込でないか、意図した重複かをご確認ください。重複が誤りとは限りません。'
+          }));
+        });
+      } else {
+        issues.push(issue('info', '同じ口座あての明細が ' + rows.length + ' 件あります（' +
+          rows.map(function (r) { return r.no + ' 行目'; }).join('、') + '）。金額は異なります。',
+        { recordIndex: rows[0].index, hint: 'まとめて 1 件にできないかご確認ください。' }));
+      }
+    });
   }
 
   function countByLevel(issues) {
@@ -907,6 +1192,7 @@
     parse: parse,
     serialize: serialize,
     createEmpty: createEmpty,
+    normalizeRecordLengths: normalizeRecordLengths,
     blankRecord: blankRecord,
     makeRecord: makeRecord,
     rawField: rawField,
@@ -921,11 +1207,14 @@
     recordsOfKind: recordsOfKind,
     groups: groups,
     groupLabel: groupLabel,
+    dataDefMap: dataDefMap,
+    hasMixedVariants: hasMixedVariants,
     aggregateSpecs: aggregateSpecs,
     computeAggregates: computeAggregates,
     summarize: summarize,
     recalcTrailer: recalcTrailer,
     validate: validate,
+    usesEbcdic: usesEbcdic,
     countByLevel: countByLevel,
     toCsv: toCsv,
     toNumber: toNumber,
