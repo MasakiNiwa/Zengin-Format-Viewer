@@ -257,6 +257,132 @@ try {
     check('検証エラーなし', await page.locator('.docbar-stats .chip-err').count() === 0);
   }
 
+  console.log('\n変更内容の差分確認');
+  {
+    await page.evaluate(() => { window.onbeforeunload = null; });
+    await page.goto(base, { waitUntil: 'networkidle' });
+    await page.locator('.sample-chip', { hasText: '総合振込' }).first().click();
+    await page.waitForTimeout(600);
+
+    check('編集前は変更バッジが出ない', await page.locator('#btn-show-diff').count() === 0);
+
+    // 1 件セルを編集する
+    await page.locator('.tab[data-tab="data"]').click();
+    await page.waitForTimeout(300);
+    const amount = page.locator('#panel-data td.cell[data-field="amount"]').first();
+    const beforeText = (await amount.innerText()).trim();
+    await amount.click();
+    await page.keyboard.press('Enter');
+    await page.keyboard.press('Control+a');
+    await page.keyboard.type('120000');
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(400);
+    check('変更バッジが出る', await page.locator('#btn-show-diff').count() === 1);
+    check('変更件数を表示', (await page.locator('#btn-show-diff').innerText()).includes('変更 1 件'),
+      await page.locator('#btn-show-diff').innerText());
+    void beforeText;
+
+    await page.locator('#btn-show-diff').click();
+    await page.waitForTimeout(400);
+    check('差分ダイアログが開く', await page.locator('#diff-dialog[open]').count() === 1);
+    const diffText = await page.locator('#diff-body').innerText();
+    check('変更した項目名が出る', diffText.includes('振込金額'), diffText.slice(0, 120));
+    check('変更前の値が出る', diffText.includes(beforeText), diffText.slice(0, 240));
+    check('変更後の値が出る', diffText.includes('120,000 円'), diffText.slice(0, 240));
+    check('送信しない旨を明記', (await page.locator('#diff-dialog').innerText()).includes('送信・保存されません'));
+    await page.locator('#diff-close').click();
+    await page.waitForTimeout(300);
+
+    // 行の追加と削除
+    await page.locator('#panel-data .btn', { hasText: '行を追加' }).click();
+    await page.waitForTimeout(400);
+    await page.locator('#btn-show-diff').click();
+    await page.waitForTimeout(400);
+    check('行追加を検知', (await page.locator('#diff-body').innerText()).includes('追加'));
+    await page.locator('#diff-close').click();
+    await page.waitForTimeout(300);
+
+    await page.locator('#panel-data tbody tr').last().locator('.row-btn').click();
+    await page.waitForTimeout(400);
+    await page.locator('#panel-data tbody tr').nth(1).locator('.row-btn').click();
+    await page.waitForTimeout(400);
+    await page.locator('#btn-show-diff').click();
+    await page.waitForTimeout(400);
+    check('行削除を検知', (await page.locator('#diff-body').innerText()).includes('削除'));
+    await page.locator('#diff-close').click();
+    await page.waitForTimeout(300);
+
+    // 書き出し確認にも変更件数が出る
+    await page.locator('[data-menu-trigger]').click();
+    await page.waitForTimeout(150);
+    await page.locator('#btn-save-zengin').click();
+    await page.waitForTimeout(400);
+    check('書き出し確認に変更件数を表示',
+      (await page.locator('#export-dialog').innerText()).includes('読み込み後の変更'));
+    await page.locator('#export-cancel').click();
+    await page.waitForTimeout(300);
+  }
+
+  console.log('\n重複明細の確認');
+  {
+    await page.evaluate(() => { window.onbeforeunload = null; });
+    await page.goto(base, { waitUntil: 'networkidle' });
+    await page.locator('.sample-chip', { hasText: '総合振込' }).first().click();
+    await page.waitForTimeout(600);
+    await page.locator('.tab[data-tab="data"]').click();
+    await page.waitForTimeout(300);
+
+    // 4 行目を 1 行目と同じ口座・同じ金額にする
+    const copy = async (field) => {
+      const src = (await page.locator(`#panel-data tbody tr:nth-child(1) td[data-field="${field}"]`).innerText()).trim();
+      const cell = page.locator(`#panel-data tbody tr:nth-child(4) td[data-field="${field}"]`);
+      await cell.click();
+      await page.keyboard.press('Enter');
+      await page.keyboard.press('Control+a');
+      await page.keyboard.type(src.replace(/[,—]/g, '').split(' ')[0]);
+      await page.keyboard.press('Enter');
+      await page.waitForTimeout(200);
+    };
+    for (const f of ['bankCode', 'branchCode', 'depositType', 'accountNumber', 'amount']) await copy(f);
+    await page.waitForTimeout(400);
+
+    await page.locator('.tab[data-tab="issues"]').click();
+    await page.waitForTimeout(400);
+    const issueText = await page.locator('#panel-issues').innerText();
+    check('同一口座・同一金額を警告', issueText.includes('同じ口座・同じ金額'), issueText.slice(0, 200));
+    check('確認を促す表現', issueText.includes('意図した重複'));
+  }
+
+  console.log('\nEBCDIC の安全確認');
+  {
+    // コード区分を 1（EBCDIC）にしたファイルを作って読み込ませる
+    const sample = path.join(root, 'tools', '.browser-test-ebcdic.txt');
+    await page.evaluate(() => { window.onbeforeunload = null; });
+    await page.goto(base, { waitUntil: 'networkidle' });
+    const bytes = await page.evaluate(() => {
+      const codec = window.ZenginCharset.getCodec('shift_jis');
+      const lines = codec.decode(window.ZenginSamples.build('21')).split('\r\n').filter(Boolean);
+      lines[0] = lines[0].slice(0, 3) + '1' + lines[0].slice(4);
+      return Array.from(codec.encode(lines.join('\r\n') + '\r\n'));
+    });
+    fs.writeFileSync(sample, Buffer.from(bytes));
+    await page.locator('#file-input').setInputFiles(sample);
+    await page.waitForTimeout(700);
+    fs.unlinkSync(sample);
+
+    check('EBCDIC を明確に知らせる',
+      (await page.locator('#panel-summary .notice-card.is-danger').innerText()).includes('EBCDIC'));
+    check('検証でエラー扱い', await page.locator('.docbar-stats .chip-err').count() === 1);
+
+    await page.locator('[data-menu-trigger]').click();
+    await page.waitForTimeout(150);
+    await page.locator('#btn-save-zengin').click();
+    await page.waitForTimeout(500);
+    check('書き出し確認画面を開かない', await page.locator('#export-dialog[open]').count() === 0);
+    check('理由を通知する',
+      (await page.locator('#toast-host').innerText()).includes('EBCDIC'));
+  }
+
   console.log('\nテーマとレスポンシブ');
   await page.locator('#btn-theme').click();
   await page.waitForTimeout(250);

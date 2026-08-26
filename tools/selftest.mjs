@@ -273,6 +273,248 @@ console.log('\n項目ごとの使用文字（付録 1）');
     Zengin.validate(doc).some((i) => i.level === 'warn' && i.message.includes('使用文字一覧')));
 }
 
+console.log('\n往復の境界条件（未編集なら 1 バイトも変えない）');
+{
+  const codec = Charset.getCodec('shift_jis');
+  const lines = codec.decode(Samples.build('21')).split('\r\n').filter(Boolean);
+  const roundTrip = (name, bytes) => {
+    const doc = Zengin.parse(bytes, {});
+    const out = Zengin.serialize(doc);
+    check(name, out.length === bytes.length && out.every((b, i) => b === bytes[i]),
+      `in=${bytes.length} out=${out.length}`);
+  };
+  roundTrip('CRLF・末尾改行あり', codec.encode(lines.join('\r\n') + '\r\n'));
+  roundTrip('CRLF・末尾改行なし', codec.encode(lines.join('\r\n')));
+  roundTrip('LF・末尾改行あり', codec.encode(lines.join('\n') + '\n'));
+  roundTrip('LF・末尾改行なし', codec.encode(lines.join('\n')));
+  roundTrip('改行なしの連結', codec.encode(lines.join('')));
+  roundTrip('UTF-8 BOM 付き', new TextEncoder().encode('\uFEFF' + lines.join('\r\n') + '\r\n'));
+  roundTrip('規定より短いレコード',
+    codec.encode(lines.slice(0, -1).join('\r\n') + '\r\n' + '9\r\n'));
+  roundTrip('規定より長いレコード',
+    codec.encode(lines.map((l, i) => (i === 2 ? l + 'XX' : l)).join('\r\n') + '\r\n'));
+  const withRaw = codec.encode(lines.join('\r\n') + '\r\n');
+  withRaw[300] = 0x80; withRaw[301] = 0xfd;
+  roundTrip('未定義バイトを含む', withRaw);
+
+  // 桁数の過不足は、読み込みでは直さず検証で伝える
+  const shortDoc = Zengin.parse(codec.encode(lines.slice(0, -1).join('\r\n') + '\r\n' + '9\r\n'), {});
+  const shortIssue = Zengin.validate(shortDoc).find((i) => i.message.includes('レコード長が 1 桁'));
+  check('短いレコードは警告として伝える', !!shortIssue && shortIssue.level === 'warn');
+  check('レコード長をそろえられる', Zengin.normalizeRecordLengths(shortDoc) === 1 &&
+    shortDoc.records.every((r) => r.text.length === 120));
+}
+
+console.log('\n数字項目の判定');
+{
+  const fmt = Formats.getFormat('21');
+  const dataDef = fmt.records.data;
+  const build = (key, raw) => {
+    const doc = Zengin.createEmpty('21');
+    const rec = Zengin.blankRecord(fmt, 'data');
+    const field = dataDef.byKey[key];
+    rec.text = rec.text.slice(0, field.pos - 1) + raw + rec.text.slice(field.end);
+    doc.records.splice(1, 0, rec);
+    return Zengin.validate(doc).filter((i) => i.fieldKey === key && i.level === 'error');
+  };
+  check('0012345 は正常', build('accountNumber', '0012345').length === 0);
+  check('12 345 は数字と空白の混在として検出',
+    build('accountNumber', '12 345 ').some((i) => i.message.includes('混在')));
+  check('先頭が空白でも検出',
+    build('accountNumber', '  12345').some((i) => i.message.includes('混在')));
+  check('任意項目の全桁空白は許容',
+    build('clearingCode', '    ').length === 0);
+  check('数字以外は従来どおり検出',
+    build('accountNumber', 'ABC1234').some((i) => i.message.includes('数字以外')));
+}
+
+console.log('\n日付の妥当性');
+{
+  const fmt = Formats.getFormat('21');
+  const dateOk = (mmdd) => {
+    const doc = Zengin.createEmpty('21');
+    Zengin.setField(doc.records[0], fmt.records.header.byKey.transferDate, mmdd);
+    return !Zengin.validate(doc).some((i) => i.message.includes('日付として不正'));
+  };
+  check('0430 は通る', dateOk('0430'));
+  check('0431 は弾く', !dateOk('0431'));
+  check('0229 は通す（和暦のため閏年を判定しない）', dateOk('0229'));
+  check('0230 は弾く', !dateOk('0230'));
+  check('1231 は通る', dateOk('1231'));
+  check('0000 は弾く', !dateOk('0000'));
+}
+
+console.log('\nコード区分 EBCDIC の扱い');
+{
+  const codec = Charset.getCodec('shift_jis');
+  const lines = codec.decode(Samples.build('21')).split('\r\n').filter(Boolean);
+  lines[0] = lines[0].slice(0, 3) + '1' + lines[0].slice(4);
+  const doc = Zengin.parse(codec.encode(lines.join('\r\n') + '\r\n'), {});
+  check('EBCDIC 宣言を検出', Zengin.usesEbcdic(doc) === true);
+  const issue = Zengin.validate(doc).find((i) => i.message.includes('EBCDIC'));
+  check('未対応としてエラーで伝える', !!issue && issue.level === 'error');
+  check('書き出しを止める旨を伝える', !!issue && issue.hint.includes('書き出しは行えません'));
+
+  const normal = Zengin.parse(Samples.build('21'), {});
+  check('JIS のファイルは対象外', Zengin.usesEbcdic(normal) === false);
+}
+
+console.log('\nエンド・レコードの集計値');
+{
+  const codec = Charset.getCodec('shift_jis');
+  const lines = codec.decode(Samples.build('03')).split('\r\n').filter(Boolean);
+  const last = lines.length - 1;
+  lines[last] = lines[last].slice(0, 1) + '0000000099' + '00009' + lines[last].slice(16);
+  const doc = Zengin.parse(codec.encode(lines.join('\r\n') + '\r\n'), {});
+  const issues = Zengin.validate(doc).filter((i) => i.message.includes('エンド・レコード'));
+  check('口座数の不一致を検出', issues.some((i) => i.message.includes('口座数')));
+  check('レコード総件数の不一致を検出', issues.some((i) => i.message.includes('レコード総件数')));
+  Zengin.recalcTrailer(doc);
+  check('再計算で解消', Zengin.validate(doc)
+    .filter((i) => i.message.includes('エンド・レコード')).length === 0);
+
+  // エンド自身を含める / 含めないのどちらの数え方でも指摘しない
+  const endDef = doc.format.records.end;
+  const endRec = Zengin.recordsOfKind(doc, 'end')[0];
+  Zengin.setField(endRec, endDef.byKey.recordTotal, String(doc.records.length - 1));
+  check('エンドを除く数え方も許容', !Zengin.validate(doc)
+    .some((i) => i.message.includes('レコード総件数')));
+}
+
+console.log('\n預金口座振替の処理結果');
+{
+  const result = Zengin.parse(Samples.build('91', { withResult: true }), {});
+  check('正しい結果ファイルは指摘なし',
+    Zengin.validate(result).filter((i) => i.message.includes('振替')).length === 0);
+
+  const trailerDef = result.format.records.trailer;
+  const trailer = Zengin.recordsOfKind(result, 'trailer')[0];
+  Zengin.setField(trailer, trailerDef.byKey.doneAmount, '1');
+  const issues = Zengin.validate(result);
+  check('振替済金額の不一致を検出',
+    issues.some((i) => i.message.includes('振替済金額') && i.message.includes('求めた値')));
+  check('振替済＋振替不能＝合計金額 も検証',
+    issues.some((i) => i.message.includes('合計が、合計金額')));
+
+  const request = Zengin.parse(Samples.build('91'), {});
+  check('依頼明細では結果の突合を行わない',
+    Zengin.validate(request).filter((i) => i.message.includes('振替')).length === 0);
+}
+
+console.log('\n重複明細の確認（振込依頼系のみ）');
+{
+  const doc = Zengin.parse(Samples.build('21'), {});
+  const dataDef = doc.format.records.data;
+  const rows = Zengin.recordsOfKind(doc, 'data');
+  const dupIssues = () => Zengin.validate(doc).filter((i) => i.message.includes('同じ口座'));
+  check('通常のサンプルでは指摘しない', dupIssues().length === 0);
+
+  const copyKeys = ['bankCode', 'branchCode', 'depositType', 'accountNumber'];
+  copyKeys.forEach((k) =>
+    Zengin.setField(rows[3], dataDef.byKey[k], Zengin.readField(rows[0], dataDef.byKey[k])));
+  Zengin.setField(rows[3], dataDef.byKey.amount, Zengin.readField(rows[0], dataDef.byKey.amount));
+  Zengin.recalcTrailer(doc);
+  const exact = dupIssues();
+  check('同一口座＋同一金額を警告', exact.length === 1 && exact[0].level === 'warn',
+    exact.map((i) => i.level).join(','));
+  check('確認を促す表現である', exact[0].hint.includes('重複が誤りとは限りません'));
+
+  Zengin.setField(rows[3], dataDef.byKey.amount, '999');
+  Zengin.recalcTrailer(doc);
+  const partial = dupIssues();
+  check('同一口座＋別金額は情報にとどめる',
+    partial.length === 1 && partial[0].level === 'info', partial.map((i) => i.level).join(','));
+
+  // 別口座で同じ金額は重複扱いしない
+  Zengin.setField(rows[3], dataDef.byKey.accountNumber, '9999999');
+  Zengin.setField(rows[3], dataDef.byKey.amount, Zengin.readField(rows[0], dataDef.byKey.amount));
+  Zengin.recalcTrailer(doc);
+  check('別口座＋同一金額は指摘しない', dupIssues().length === 0);
+
+  // 入金系フォーマットは対象外
+  const incoming = Zengin.parse(Samples.build('01'), {});
+  check('入金系は重複チェックの対象外',
+    Zengin.validate(incoming).filter((i) => i.message.includes('同じ口座')).length === 0);
+}
+
+console.log('\nダミー領域の固定値');
+{
+  const doc = Zengin.parse(Samples.build('03'), {});
+  check('規定どおりなら指摘しない',
+    Zengin.validate(doc).filter((i) => i.message.includes('規定では')).length === 0);
+  const headerDef = doc.format.records.header;
+  const header = Zengin.recordsOfKind(doc, 'header')[0];
+  const field = headerDef.byKey.reserved;
+  header.text = header.text.slice(0, field.pos - 1) + '123' + header.text.slice(field.end);
+  const issue = Zengin.validate(doc).find((i) => i.message.includes('規定では'));
+  check('「0」で埋める領域の違いを警告', !!issue && issue.level === 'warn');
+  check('銀行独自使用の可能性にも触れる', !!issue && issue.hint.includes('独自に使用'));
+}
+
+console.log('\n口座ごとのレイアウト判定');
+{
+  const codec = Charset.getCodec('shift_jis');
+  const base = Formats.getFormat('03');
+  const timeFmt = Formats.withVariant(base, 'time');
+  const liquid = Zengin.parse(Samples.build('03'), {});
+  const lines = codec.decode(Samples.build('03')).split('\r\n').filter(Boolean);
+
+  // 2 組目として、定期預金（預金種目 6）のヘッダーと定期性データを足す
+  const header2 = Zengin.blankRecord(timeFmt, 'header');
+  const hd = timeFmt.records.header;
+  Zengin.setField(header2, hd.byKey.codeKubun, '0');
+  Zengin.setField(header2, hd.byKey.createdDate, '060501');
+  Zengin.setField(header2, hd.byKey.periodFrom, '060401');
+  Zengin.setField(header2, hd.byKey.periodTo, '060430');
+  Zengin.setField(header2, hd.byKey.bankCode, '0009');
+  Zengin.setField(header2, hd.byKey.branchCode, '227');
+  Zengin.setField(header2, hd.byKey.reserved, '0');
+  Zengin.setField(header2, hd.byKey.depositType, '6');
+  Zengin.setField(header2, hd.byKey.accountNumber, '7654321');
+
+  const td = timeFmt.records.data;
+  const data2 = Zengin.blankRecord(timeFmt, 'data');
+  Zengin.setField(data2, td.byKey.valueDate, '060415');
+  Zengin.setField(data2, td.byKey.paymentDate, '060415');
+  Zengin.setField(data2, td.byKey.inOutKubun, '1');
+  Zengin.setField(data2, td.byKey.txKind, '15');
+  Zengin.setField(data2, td.byKey.amount, '3000000');
+  Zengin.setField(data2, td.byKey.billAmount, '0');
+  Zengin.setField(data2, td.byKey.rate, '000100');
+  Zengin.setField(data2, td.byKey.maturityDate, '070415');
+
+  const trailer2 = Zengin.blankRecord(timeFmt, 'trailer');
+  const mixedLines = lines.slice(0, -1)
+    .concat([header2.text, data2.text, trailer2.text, lines[lines.length - 1]]);
+  const mixed = Zengin.parse(codec.encode(mixedLines.join('\r\n') + '\r\n'), {});
+
+  const groups = Zengin.groups(mixed);
+  check('グループが 2 組に分かれる', groups.length === 2);
+  check('1 組目は流動性預金のレイアウト', groups[0].variantKey === 'liquid', String(groups[0].variantKey));
+  check('2 組目は定期性預金のレイアウト', groups[1].variantKey === 'time', String(groups[1].variantKey));
+  check('レイアウト混在を検知', Zengin.hasMixedVariants(mixed) === true);
+
+  const defs = Zengin.dataDefMap(mixed);
+  const secondData = groups[1].data[0];
+  check('2 組目は定期性の項目で読める',
+    Zengin.readField(secondData, defs[secondData.id].byKey.rate) === '000100',
+    Zengin.readField(secondData, defs[secondData.id].byKey.rate));
+  check('1 組目は流動性の項目で読める',
+    !!defs[groups[0].data[0].id].byKey.remitterName);
+
+  Zengin.recalcTrailer(mixed);
+  const errors = Zengin.validate(mixed).filter((i) => i.level === 'error');
+  check('混在ファイルでもエラーなし', errors.length === 0,
+    errors.slice(0, 2).map((e) => e.message).join(' / '));
+  check('レイアウトが分かれる旨を情報として伝える',
+    Zengin.validate(mixed).some((i) => i.level === 'info' && i.message.includes('レイアウトが異なる')));
+
+  const out = Zengin.serialize(mixed);
+  const src = codec.encode(mixedLines.join('\r\n') + '\r\n');
+  check('混在ファイルも往復で壊れない', out.length === src.length);
+  void liquid;
+}
+
 console.log('\n読み込みの頑健性');
 {
   // 改行なしの連結ファイル

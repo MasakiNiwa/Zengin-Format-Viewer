@@ -103,9 +103,12 @@
     return def;
   }
 
-  /** ダミー項目（スペース）。 */
+  /**
+   * ダミー項目。規定書が「スペースとする」と定めている領域。
+   * fill を持つ項目は、その文字で埋まっているかを検証できる。
+   */
   function dummy(len, key) {
-    return f(key || 'dummy', 'ダミー', len, 'C', { dummy: true, hint: 'スペースとする' });
+    return f(key || 'dummy', 'ダミー', len, 'C', { dummy: true, fill: ' ', hint: 'スペースとする' });
   }
 
   /** データ区分の固定項目。 */
@@ -153,6 +156,7 @@
     direction: 'submit',
     description: '振込依頼人（企業等）が同時に多数の振込を依頼する場合の振込明細です。',
     recordLength: 120,
+    duplicateKeys: ['bankCode', 'branchCode', 'depositType', 'accountNumber'],
     records: {
       header: record('1', 'ヘッダー・レコード', [
         kubunField('1'),
@@ -216,6 +220,7 @@
       direction: 'submit',
       description: description,
       recordLength: 120,
+      duplicateKeys: ['bankCode', 'branchCode', 'depositType', 'accountNumber'],
       records: {
         header: record('1', 'ヘッダー・レコード', [
           kubunField('1'),
@@ -279,6 +284,7 @@
     direction: 'submit',
     description: '収納企業（委託者）が預金口座振替を銀行に依頼する明細です。処理結果明細の読み込みにも対応します。',
     recordLength: 120,
+    duplicateKeys: ['bankCode', 'branchCode', 'depositType', 'accountNumber'],
     records: {
       header: record('1', 'ヘッダー・レコード', [
         kubunField('1'),
@@ -551,7 +557,7 @@
         f('bankName', '銀行名', 15, 'C', { role: 'originBankName', charClass: 'branch' }),
         f('branchCode', '支店コード', 3, 'N', { role: 'originBranchCode', required: true, hint: '統一店番号' }),
         f('branchName', '支店名', 15, 'C', { role: 'originBranchName', charClass: 'branch' }),
-        f('reserved', 'ダミー', 3, 'N', { dummy: true, hint: '将来の拡張用。すべて「0」とする' }),
+        f('reserved', 'ダミー', 3, 'N', { dummy: true, fill: '0', hint: '将来の拡張用。すべて「0」とする' }),
         f('depositType', '預金種目', 1, 'N', { codes: CODE.deposit1to7, role: 'depositType', required: true }),
         f('accountNumber', '口座番号', 10, 'N', { role: 'accountNumber', required: true }),
         f('accountName', '口座名', 40, 'C', { role: 'requesterName', charClass: 'name' }),
@@ -574,8 +580,8 @@
       ]),
       end: record('9', 'エンド・レコード', [
         kubunField('9'),
-        f('recordTotal', 'レコード総件数', 10, 'N', { format: 'count' }),
-        f('accountTotal', '口座数', 5, 'N', { format: 'count' }),
+        f('recordTotal', 'レコード総件数', 10, 'N', { role: 'recordTotal', format: 'count' }),
+        f('accountTotal', '口座数', 5, 'N', { role: 'accountTotal', format: 'count' }),
         dummy(184)
       ])
     },
@@ -618,7 +624,7 @@
         f('baseDate', '基準日', 6, 'N', { format: 'yymmdd', required: true, hint: '現在残高の基準日' }),
         f('baseTime', '基準時刻', 4, 'N', { format: 'hhmm', optional: true }),
         f('branchCode', '支店コード', 3, 'N', { required: true, hint: '統一店番号' }),
-        f('reserved', 'ダミー', 3, 'N', { dummy: true, hint: '将来の拡張用。すべて「000」とする' }),
+        f('reserved', 'ダミー', 3, 'N', { dummy: true, fill: '0', hint: '将来の拡張用。すべて「000」とする' }),
         f('depositType', '預金種目', 1, 'N', { codes: CODE.depositAll, required: true }),
         f('accountNumber', '口座番号', 10, 'N', { required: true }),
         f('accountCount', '口数', 4, 'N', { optional: true, hint: '通知預金・定期預金における口数' }),
@@ -643,7 +649,7 @@
       ]),
       end: record('9', 'エンド・レコード', [
         kubunField('9'),
-        f('recordTotal', 'レコード総件数', 10, 'N', { format: 'count' }),
+        f('recordTotal', 'レコード総件数', 10, 'N', { role: 'recordTotal', format: 'count' }),
         dummy(189)
       ])
     },
