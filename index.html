@@ -84,6 +84,23 @@
       <div class="sample-chips" id="sample-chips"></div>
     </div>
 
+    <section class="disclaimer-panel" aria-labelledby="welcome-disclaimer-title">
+      <span class="disclaimer-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 9v4.5M12 17v.1"/><path d="M10.3 3.9 2.6 17.4A2 2 0 0 0 4.3 20.4h15.4a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>
+        </svg>
+      </span>
+      <div>
+        <h2 id="welcome-disclaimer-title">本ツールの出力は「参考」です。ご利用はすべて自己責任でお願いします。</h2>
+        <ul>
+          <li>本ツールが表示・出力する内容の正確性および完全性について、作者は<strong>いかなる保証も行いません</strong>。</li>
+          <li>検証機能は全銀協制定フォーマットの一般的な仕様に基づくものです。<strong>金融機関ごとの独自ルールは検出できません。</strong></li>
+          <li>銀行へ提出する前に、必ずお取引金融機関の仕様書と照合してください。</li>
+          <li>本ツールの利用によって生じた<strong>いかなる損害についても、作者は一切の責任を負いません</strong>。</li>
+        </ul>
+      </div>
+    </section>
+
     <ul class="feature-grid">
       <li>
         <span class="feature-icon" aria-hidden="true">
@@ -100,7 +117,7 @@
         </span>
         <div>
           <h3>種別コードを自動判定</h3>
-          <p>総合振込・給与振込・賞与振込・預金口座振替に対応。未対応の種別も原文のまま安全に表示します。</p>
+          <p>銀行へ提出する 4 種類（総合振込・給与・賞与・口座振替）と、銀行から受け取る 3 種類（振込入金通知・入出金取引明細・残高通知）に対応します。</p>
         </div>
       </li>
       <li>
@@ -109,7 +126,7 @@
         </span>
         <div>
           <h3>桁数・文字種・合計を自動チェック</h3>
-          <p>使用できない文字、必須項目もれ、トレーラーの合計不一致などを読み込み時に洗い出します。</p>
+          <p>使用できない文字、必須項目もれ、トレーラの合計不一致などを読み込み時に洗い出します（結果はあくまで参考です）。</p>
         </div>
       </li>
       <li>
@@ -148,7 +165,7 @@
     <button type="button" role="tab" class="tab" data-tab="data" aria-controls="panel-data" aria-selected="false">
       データ明細 <span class="tab-count" id="tab-count-data">0</span>
     </button>
-    <button type="button" role="tab" class="tab" data-tab="trailer" aria-controls="panel-trailer" aria-selected="false">トレーラー</button>
+    <button type="button" role="tab" class="tab" data-tab="trailer" aria-controls="panel-trailer" aria-selected="false">トレーラ</button>
     <button type="button" role="tab" class="tab" data-tab="raw" aria-controls="panel-raw" aria-selected="false">生データ</button>
     <button type="button" role="tab" class="tab" data-tab="issues" aria-controls="panel-issues" aria-selected="false">
       検証 <span class="tab-count" id="tab-count-issues">0</span>
@@ -163,6 +180,12 @@
     <section class="panel panel-flush" id="panel-raw" role="tabpanel" tabindex="0"></section>
     <section class="panel" id="panel-issues" role="tabpanel" tabindex="0"></section>
   </div>
+
+  <footer class="disclaimer-bar">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 9v4.5M12 17v.1"/><path d="M10.3 3.9 2.6 17.4A2 2 0 0 0 4.3 20.4h15.4a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>
+    <span><strong>本ツールの表示・出力はあくまで参考です。</strong>銀行へ提出する前に必ず金融機関の仕様書と照合してください。本ツールの利用により生じたいかなる損害についても、作者は一切の責任を負いません。</span>
+    <button type="button" class="disclaimer-more" id="btn-disclaimer-more">詳しく</button>
+  </footer>
 </main>
 
 <!-- ================= ヘルプ ================= -->
@@ -186,6 +209,31 @@
   <div class="dialog-actions">
     <button type="button" class="btn" id="confirm-cancel">キャンセル</button>
     <button type="button" class="btn btn-danger" id="confirm-ok">実行</button>
+  </div>
+</dialog>
+
+<dialog class="dialog dialog-export" id="export-dialog" aria-labelledby="export-title">
+  <div class="export-head">
+    <span class="disclaimer-icon" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 9v4.5M12 17v.1"/><path d="M10.3 3.9 2.6 17.4A2 2 0 0 0 4.3 20.4h15.4a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>
+      </svg>
+    </span>
+    <h2 id="export-title">書き出す前にご確認ください</h2>
+  </div>
+  <div class="export-body">
+    <p class="export-lead">これから書き出すファイルは<strong>参考用</strong>です。内容の正確性・完全性について、作者はいかなる保証も行いません。</p>
+    <ul class="export-points">
+      <li>銀行へ提出する前に、必ず<strong>お取引金融機関の仕様書と照合</strong>してください。</li>
+      <li>検証機能は一般的な仕様に基づくものです。金融機関ごとの独自ルール（使用できる記号、金額の上限など）は検出できません。</li>
+      <li>このファイルの利用によって生じた<strong>いかなる損害についても、作者は一切の責任を負いません</strong>。</li>
+    </ul>
+    <div id="export-status"></div>
+    <dl class="export-meta" id="export-meta"></dl>
+  </div>
+  <div class="dialog-actions">
+    <button type="button" class="btn" id="export-cancel">キャンセル</button>
+    <button type="button" class="btn btn-primary" id="export-ok">確認のうえ書き出す</button>
   </div>
 </dialog>
 

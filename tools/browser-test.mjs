@@ -61,8 +61,11 @@ try {
   await page.goto(base, { waitUntil: 'networkidle' });
 
   console.log('初期画面');
-  check('サンプルが 5 件', await page.locator('.sample-chip').count() === 5);
+  check('サンプルが 8 件', await page.locator('.sample-chip').count() === 8);
+  check('提出用と受取用に分けて並ぶ', await page.locator('.sample-group').count() === 2);
   check('未読込では書き出しメニューを隠す', !(await page.locator('[data-menu]').isVisible()));
+  check('初期画面に免責を明記', (await page.locator('.disclaimer-panel').innerText())
+    .includes('一切の責任を負いません'));
 
   console.log('\n読み込みと自動判定');
   await page.locator('.sample-chip', { hasText: '総合振込' }).first().click();
@@ -70,8 +73,10 @@ try {
   await page.waitForTimeout(400);
   check('種別コードを自動判定', (await page.locator('#format-code').textContent()).trim() === '21');
   check('データ件数を表示', (await page.locator('#tab-count-data').textContent()).trim() === '10');
-  check('検証エラーなし', await page.locator('.docbar-stats .chip-ok').count() === 1);
+  check('検証エラーなし', await page.locator('.docbar-stats .chip-err').count() === 0);
   check('書き出しメニューが出る', await page.locator('[data-menu]').isVisible());
+  check('作業画面にも免責を常時表示', (await page.locator('.disclaimer-bar').innerText())
+    .includes('一切の責任を負いません'));
 
   console.log('\nタブ');
   for (const [tab, sel] of [['header', '.field-grid'], ['data', '.ztable'],
@@ -105,7 +110,7 @@ try {
 
   await page.locator('#panel-data .btn', { hasText: '合計を再計算' }).click();
   await page.waitForTimeout(400);
-  check('合計再計算でエラー解消', await page.locator('.docbar-stats .chip-ok').count() === 1);
+  check('合計再計算でエラー解消', await page.locator('.docbar-stats .chip-err').count() === 0);
 
   console.log('\n行操作と検索');
   await page.locator('#panel-data input[type="search"]').fill('0010');
@@ -162,9 +167,25 @@ try {
   console.log('\n書き出し');
   await page.locator('[data-menu-trigger]').click();
   await page.waitForTimeout(150);
+  await page.locator('#btn-save-zengin').click();
+  await page.waitForTimeout(400);
+  check('書き出し前に確認画面が出る', await page.locator('#export-dialog[open]').count() === 1);
+  const dialogText = await page.locator('#export-dialog').innerText();
+  check('確認画面で参考ファイルと念押し', dialogText.includes('参考用'));
+  check('確認画面で免責を明記', dialogText.includes('一切の責任を負いません'));
+  check('確認画面に照合の依頼', dialogText.includes('金融機関の仕様書と照合'));
+
+  await page.locator('#export-cancel').click();
+  await page.waitForTimeout(300);
+  check('キャンセルで閉じる', await page.locator('#export-dialog[open]').count() === 0);
+
+  await page.locator('[data-menu-trigger]').click();
+  await page.waitForTimeout(150);
+  await page.locator('#btn-save-zengin').click();
+  await page.waitForTimeout(300);
   const [download] = await Promise.all([
     page.waitForEvent('download'),
-    page.locator('#btn-save-zengin').click()
+    page.locator('#export-ok').click()
   ]);
   const saved = path.join(root, 'tools', '.browser-test-output.txt');
   await download.saveAs(saved);
@@ -173,37 +194,67 @@ try {
   check('13 レコード × 122 バイト（120 桁 + CRLF）', buffer.length === 13 * 122, String(buffer.length));
   check('CRLF 区切り', buffer[120] === 0x0d && buffer[121] === 0x0a);
 
-  console.log('\n入出金系フォーマット（200 桁・レイアウト未登録）');
+  console.log('\n照会・通知系フォーマット（200 桁）');
   {
-    // 種別コード 03（入出金取引明細）を模した 200 桁のファイルを読み込ませる
-    const sample = path.join(root, 'tools', '.browser-test-200.txt');
-    const line = (kubun, rest = '') => (kubun + rest).padEnd(200, ' ');
-    fs.writeFileSync(sample, Buffer.from(
-      [line('1', '030'), line('2'), line('2'), line('2'), line('8'), line('9')]
-        .join('\r\n') + '\r\n', 'binary'));
     await page.evaluate(() => { window.onbeforeunload = null; });
     await page.goto(base, { waitUntil: 'networkidle' });
-    await page.locator('#file-input').setInputFiles(sample);
-    await page.waitForTimeout(700);
-    fs.unlinkSync(sample);
+    await page.locator('.sample-chip', { hasText: '入出金取引明細' }).first().click();
+    await page.waitForTimeout(600);
 
     check('種別コード 03 を識別', (await page.locator('#format-code').textContent()).trim() === '03');
-    check('名称を表示', (await page.locator('#format-name').textContent()).includes('入出金取引明細'));
     check('200 桁として読み込む',
       (await page.locator('#file-meta').textContent()).includes('200桁'));
-    check('データ件数を数える', (await page.locator('#tab-count-data').textContent()).trim() === '3');
-    check('レイアウト未登録の案内を出す',
-      (await page.locator('#panel-summary .notice-card').innerText()).includes('項目レイアウトが未登録'));
+    check('入金・出金を分けて集計', (await page.locator('#panel-summary .kpi-row').innerText())
+      .includes('入金合計'));
     check('検証エラーなし', await page.locator('.docbar-stats .chip-err').count() === 0);
+
+    await page.locator('.tab[data-tab="data"]').click();
+    await page.waitForTimeout(300);
+    const headers = await page.locator('#panel-data thead th').allInnerTexts();
+    check('項目名つきで表示', headers.some((t) => t.includes('入払区分')) &&
+      headers.some((t) => t.includes('取引金額')), headers.join('|'));
 
     await page.locator('.tab[data-tab="raw"]').click();
     await page.waitForTimeout(300);
-    const rulerEnd = await page.evaluate(() => {
-      const ruler = document.querySelector('.raw-ruler .raw-body div:last-child');
-      return ruler.textContent.length;
-    });
-    check('桁目盛りが 200 桁ぶん出る', rulerEnd === 200, String(rulerEnd));
-    check('レコード行が 6 件', await page.locator('.raw-row').count() === 6);
+    const rulerLen = await page.evaluate(() =>
+      document.querySelector('.raw-ruler .raw-body div:last-child').textContent.length);
+    check('桁目盛りが 200 桁ぶん出る', rulerLen === 200, String(rulerLen));
+  }
+
+  console.log('\n複数グループ（残高通知）');
+  {
+    await page.evaluate(() => { window.onbeforeunload = null; });
+    await page.goto(base, { waitUntil: 'networkidle' });
+    await page.locator('.sample-chip', { hasText: '残高通知' }).first().click();
+    await page.waitForTimeout(600);
+
+    check('種別コード 04 を識別', (await page.locator('#format-code').textContent()).trim() === '04');
+    check('検証エラーなし', await page.locator('.docbar-stats .chip-err').count() === 0);
+
+    await page.locator('.tab[data-tab="data"]').click();
+    await page.waitForTimeout(300);
+    check('全 4 件を表示', await page.locator('#panel-data tbody tr').count() === 4);
+    const selector = page.locator('#panel-data .table-toolbar select').first();
+    check('口座の絞り込みが出る', (await selector.innerText()).includes('すべての口座'));
+    await selector.selectOption('0');
+    await page.waitForTimeout(300);
+    check('1 組目に絞り込める', await page.locator('#panel-data tbody tr').count() === 2);
+
+    await page.locator('.tab[data-tab="trailer"]').click();
+    await page.waitForTimeout(300);
+    check('トレーラを 2 組表示', await page.locator('#panel-trailer .card').count() === 3);
+  }
+
+  console.log('\n振込入金通知のフォーマット判定');
+  {
+    await page.evaluate(() => { window.onbeforeunload = null; });
+    await page.goto(base, { waitUntil: 'networkidle' });
+    await page.locator('.sample-chip', { hasText: '振込入金通知' }).first().click();
+    await page.waitForTimeout(600);
+    check('種別コード 01 を識別', (await page.locator('#format-code').textContent()).trim() === '01');
+    const settings = await page.locator('#panel-summary').innerText();
+    check('データ・レコードの種類を表示', settings.includes('フォーマットA'), '未表示');
+    check('検証エラーなし', await page.locator('.docbar-stats .chip-err').count() === 0);
   }
 
   console.log('\nテーマとレスポンシブ');
