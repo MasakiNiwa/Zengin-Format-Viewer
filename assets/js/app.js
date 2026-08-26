@@ -160,6 +160,57 @@
     });
   }
 
+  /**
+   * 書き出し前に、参考ファイルである旨を確認してもらう。
+   * @param {{title:string, meta:Array<[string,string]>}} info
+   */
+  function confirmExport(info) {
+    return new Promise(function (resolve) {
+      var dialog = $('#export-dialog');
+      var counts = Zengin.countByLevel(state.issues);
+
+      var status = $('#export-status');
+      var chips = [];
+      if (counts.error) {
+        chips.push(h('span', { class: 'chip chip-err' },
+          [icon(ICON.alert), 'エラー ' + counts.error + ' 件が未解決です']));
+      }
+      if (counts.warn) {
+        chips.push(h('span', { class: 'chip chip-warn' },
+          [icon(ICON.alert), '警告 ' + counts.warn + ' 件']));
+      }
+      if (!chips.length) {
+        chips.push(h('span', { class: 'chip chip-ok' }, [icon(ICON.check), '検証で問題は見つかりませんでした']));
+      }
+      status.replaceChildren(h('div', {
+        class: 'issue-summary', style: 'margin-bottom:12px'
+      }, chips));
+
+      var meta = $('#export-meta');
+      meta.replaceChildren();
+      info.meta.forEach(function (row) {
+        meta.appendChild(h('dt', { text: row[0] }));
+        meta.appendChild(h('dd', { text: row[1] }));
+      });
+
+      $('#export-ok').textContent = counts.error
+        ? 'エラーを承知のうえ書き出す'
+        : '確認のうえ書き出す';
+
+      var done = function (result) {
+        $('#export-ok').onclick = null;
+        $('#export-cancel').onclick = null;
+        dialog.onclose = null;
+        if (dialog.open) dialog.close();
+        resolve(result);
+      };
+      $('#export-ok').onclick = function () { done(true); };
+      $('#export-cancel').onclick = function () { done(false); };
+      dialog.onclose = function () { resolve(false); };
+      dialog.showModal();
+    });
+  }
+
   /* ---------------- ダウンロード ---------------- */
 
   function download(bytes, fileName, mime) {
@@ -191,6 +242,7 @@
     autoHankaku: true,
     sortKey: null,
     sortDir: 1,
+    groupIndex: null,   // null = すべてのグループ
     selected: null,      // { recordId, fieldKey }
     // 生データ
     rawPage: 1,
@@ -229,7 +281,8 @@
       var doc = Zengin.parse(bytes, {
         fileName: fileName,
         encoding: opts.encoding,
-        formatCode: opts.formatCode
+        formatCode: opts.formatCode,
+        variantKey: opts.variantKey
       });
       state.doc = doc;
       state.rawBytes = bytes;
@@ -238,6 +291,7 @@
       state.rawPage = 1;
       state.search = '';
       state.sortKey = null;
+      state.groupIndex = null;
       state.selected = null;
       state.rawSelectedId = null;
       document.body.dataset.view = 'workspace';
@@ -284,7 +338,14 @@
 
   function revalidate() {
     if (!state.doc) { state.issues = []; state.issuesByRecord = {}; return; }
-    state.issues = Zengin.validate(state.doc);
+    // 読み込み時の判定結果（文字コード・レコード長など）も検証結果として扱う
+    var notices = (state.doc.notices || []).map(function (notice) {
+      return {
+        level: notice.level, message: notice.message,
+        recordIndex: null, fieldKey: null, hint: notice.hint || ''
+      };
+    });
+    state.issues = notices.concat(Zengin.validate(state.doc));
     var map = {};
     state.issues.forEach(function (item) {
       if (item.recordIndex == null) return;
@@ -419,6 +480,34 @@
      概要タブ
      ================================================================ */
 
+  /** レイアウト定義を持たない種別コードであることを知らせる。 */
+  function buildLayoutPendingNotice() {
+    var format = state.doc.format;
+    if (!format.generic) return null;
+    return h('div', { class: 'notice-card' }, [
+      h('span', { class: 'notice-icon' }, [svg(ICON.info)]),
+      h('div', { class: 'notice-body' }, [
+        h('strong', {
+          text: '種別コード「' + (state.doc.detectedTypeCode || '不明') +
+            '」のレイアウト定義がありません'
+        }),
+        h('p', {
+          text: format.recordLength + ' 桁ごとのレコード分割、レコード構成の検証、原文の編集と書き出しは行えます。' +
+            'ただし「金額」「日付」などの項目名つき表示は、桁位置を誤ると正しく見えたまま' +
+            '誤った数値を示してしまうため行いません。'
+        }),
+        h('p', {
+          text: '桁位置の確認には「生データ」タブの桁目盛りをお使いください。' +
+            'フォーマットが分かっている場合は、ファイル情報の「フォーマット」から選び直せます。'
+        }),
+        h('button', {
+          type: 'button', class: 'btn btn-sm',
+          onclick: function () { setTab('raw'); }
+        }, ['生データで桁位置を確認', icon(ICON.arrow)])
+      ])
+    ]);
+  }
+
   function kpi(label, value, unit, sub, accent) {
     return h('div', { class: 'kpi' + (accent ? ' kpi-accent' : '') }, [
       h('div', { class: 'kpi-label', text: label }),
@@ -448,25 +537,37 @@
     var avgAmount = amounts.length ? Math.round(summary.amount / amounts.length) : 0;
 
     var nodes = [];
+    var pending = buildLayoutPendingNotice();
+    if (pending) nodes.push(pending);
 
     /* --- KPI --- */
     var kpis = [
       kpi('データ件数', num(summary.count), '件', null, true)
     ];
-    if (summary.amountField) {
+    var aggregates = Zengin.computeAggregates(doc, dataRecords);
+    var detailed = aggregates.filter(function (agg) { return agg.hasAmount && agg.spec.where; });
+    if (detailed.length) {
+      // 入出金取引明細のように、入金・出金を分けて集計するフォーマット
+      detailed.forEach(function (agg) {
+        kpis.push(kpi(agg.spec.label + '合計', num(agg.amount), '円',
+          num(agg.count) + ' 件', true));
+      });
+    } else if (summary.amountField) {
       kpis.push(kpi(summary.amountField.label + '合計', num(summary.amount), '円', null, true));
       kpis.push(kpi('平均', num(avgAmount), '円'));
       kpis.push(kpi('最高額', num(maxAmount), '円'));
     }
     kpis.push(kpi('総レコード数', num(doc.records.length), '件',
-      'ヘッダー / データ / トレーラー / エンド'));
+      Zengin.groups(doc).length > 1
+        ? Zengin.groups(doc).length + ' 組のヘッダー／トレーラを含む'
+        : 'ヘッダー / データ / トレーラ / エンド'));
     nodes.push(h('div', { class: 'kpi-row' }, kpis));
 
     /* --- 委託者情報 + ファイル情報 --- */
     var header = Zengin.recordsOfKind(doc, 'header')[0];
     var grid = [];
 
-    if (header && !format.generic) {
+    if (header && !format.generic && !format.layoutPending) {
       var hd = format.records.header;
       var dl = h('dl', { class: 'dl' });
       var get = function (key) {
@@ -537,7 +638,7 @@
     var formatOptions = Formats.listFormats().map(function (fmt) {
       return h('option', {
         value: fmt.code, selected: !doc.format.generic && doc.format.code === fmt.code,
-        text: fmt.code + '  ' + fmt.name
+        text: fmt.code + '  ' + fmt.name + (fmt.layoutPending ? '（レイアウト未登録）' : '')
       });
     });
     if (doc.format.generic) {
@@ -580,10 +681,33 @@
               (doc.formatOverridden ? '（手動で変更中）' : '')
           })
         ]),
+        doc.format.variants ? h('div', { class: 'field' }, [
+          h('div', { class: 'field-label' }, [h('span', { class: 'field-name', text: 'データ・レコードの種類' })]),
+          h('select', {
+            class: 'field-input',
+            onchange: function (event) { changeParseOption({ variantKey: event.target.value }); }
+          }, doc.format.variants.map(function (variant) {
+            return h('option', {
+              value: variant.key, selected: doc.variantKey === variant.key, text: variant.label
+            });
+          })),
+          h('div', {
+            class: 'field-hint',
+            text: '同じ種別コードでレイアウトが分かれるフォーマットです。読み込み時に自動判定しています。'
+          })
+        ]) : null,
         h('div', { class: 'field' }, [
           h('div', { class: 'field-label' }, [h('span', { class: 'field-name', text: 'レコード長 / サイズ' })]),
           h('input', { class: 'field-input', value: doc.recordLength + ' 桁 / ' + formatBytes(doc.byteLength || 0), readonly: true }),
-          h('div', { class: 'field-hint', text: '全銀フォーマットは 120 桁固定です。' })
+          h('div', {
+            class: 'field-hint',
+            text: doc.format.generic
+              ? 'レイアウト定義がないため、ファイルの構成からレコード長を推定しました。'
+              : doc.format.name + 'のレコード長は ' + doc.format.recordLength + ' 桁です。' +
+                (doc.recordLength !== doc.format.recordLength
+                  ? '（このファイルは ' + doc.recordLength + ' 桁のため、その長さのまま扱います）'
+                  : '')
+          })
         ])
       ])
     ]);
@@ -597,7 +721,9 @@
         encoding: options.encoding || doc.encoding,
         formatCode: options.formatCode !== undefined
           ? (options.formatCode || undefined)
-          : (doc.formatOverridden ? doc.format.code : undefined)
+          : (doc.formatOverridden ? doc.format.code : undefined),
+        variantKey: options.variantKey ||
+          (options.formatCode !== undefined || options.encoding ? undefined : doc.variantKey)
       });
     });
   }
@@ -661,6 +787,14 @@
     ]);
   }
 
+  /** 「問題なし」と言えるとき、実際に何を確認したのかを述べる。 */
+  function validatedScopeText() {
+    return state.doc.format.layoutPending
+      ? 'レコード構成・レコード長・文字種に問題はありません。' +
+        '項目ごとの検証は、レイアウトが未登録のため行っていません。'
+      : '桁数・文字種・必須項目・合計件数／合計金額のいずれも整合しています。';
+  }
+
   function renderValidationCard() {
     var counts = Zengin.countByLevel(state.issues);
     var body;
@@ -669,7 +803,7 @@
         svg(ICON.check),
         h('div', null, [
           h('strong', { text: '問題は見つかりませんでした' }),
-          h('span', { text: '桁数・文字種・必須項目・合計件数／合計金額のいずれも整合しています。' })
+          h('span', { text: validatedScopeText() })
         ])
       ]);
     } else {
@@ -690,7 +824,7 @@
   }
 
   /* ================================================================
-     項目フォーム（ヘッダー / トレーラー / エンド）
+     項目フォーム（ヘッダー / トレーラ / エンド）
      ================================================================ */
 
   function buildFieldControl(record, field, recordIndex) {
@@ -737,7 +871,9 @@
     }
 
     var hintText = issue ? issue.message : field.hint;
-    return h('div', { class: 'field' + (field.dummy ? ' field-full' : '') }, [
+    // 極端に長い項目だけ 1 行を占有させる（120 桁側の項目配置は変えない）
+    var wide = field.dummy || field.role === 'rawBody' || field.len >= 60;
+    return h('div', { class: 'field' + (wide ? ' field-full' : '') }, [
       h('div', { class: 'field-label' }, [
         h('span', { class: 'field-name', text: field.label }),
         h('span', { class: 'field-pos', text: field.pos + '-' + field.end + ' / ' + field.len + '桁 ' + field.type }),
@@ -827,7 +963,7 @@
   }
 
   /* ================================================================
-     トレーラータブ
+     トレーラタブ
      ================================================================ */
 
   function renderTrailerPanel() {
@@ -849,7 +985,7 @@
 
     if (!nodes.length) {
       nodes.push(h('div', { class: 'empty-state' }, [
-        h('strong', { text: 'トレーラーレコードがありません' }),
+        h('strong', { text: 'トレーラ・レコードがありません' }),
         h('span', { text: 'データ区分 8 / 9 のレコードが含まれていません。' })
       ]));
     }
@@ -859,26 +995,36 @@
   function doRecalc() {
     var result = Zengin.recalcTrailer(state.doc);
     if (!result.updated) {
-      toast('トレーラーレコードがありません', '合計を書き込む先が見つかりませんでした。', 'warn');
+      toast('トレーラ・レコードがありません', '合計を書き込む先が見つかりませんでした。', 'warn');
       return;
     }
     markDirty();
     renderAll();
     toast('合計を再計算しました',
-      num(result.count) + ' 件 / ' + num(result.amount) + ' 円をトレーラーに設定しました。', 'ok');
+      num(result.count) + ' 件 / ' + num(result.amount) + ' 円をトレーラに設定しました。', 'ok');
   }
 
   /* ================================================================
      データ明細タブ
      ================================================================ */
 
-  /** 表示対象の行（ファイル内の並び順つき）。 */
+  /** 表示対象の行（ファイル内の並び順つき）。グループを選んでいれば絞り込む。 */
   function dataRows() {
     var rows = [];
     var no = 0;
+    var scope = null;
+    if (state.groupIndex != null) {
+      var list = Zengin.groups(state.doc);
+      var group = list[state.groupIndex];
+      if (group) {
+        scope = Object.create(null);
+        group.data.forEach(function (rec) { scope[rec.id] = true; });
+      }
+    }
     state.doc.records.forEach(function (rec, index) {
       if (rec.kind !== 'data') return;
       no++;
+      if (scope && !scope[rec.id]) return;
       rows.push({ rec: rec, no: no, index: index });
     });
     return rows;
@@ -927,11 +1073,14 @@
     var start = (state.page - 1) * state.pageSize;
     var pageRows = rows.slice(start, start + state.pageSize);
 
-    panel.replaceChildren(
-      buildDataToolbar(),
-      buildDataTable(pageRows),
-      buildDataFooter(rows.length, totalRows, pageCount, start, pageRows.length)
-    );
+    var children = [buildDataToolbar()];
+    var pending = buildLayoutPendingNotice();
+    if (pending) {
+      children.push(h('div', { style: 'padding: 14px 16px 0' }, [pending]));
+    }
+    children.push(buildDataTable(pageRows));
+    children.push(buildDataFooter(rows.length, totalRows, pageCount, start, pageRows.length));
+    panel.replaceChildren.apply(panel, children);
   }
 
   function buildDataToolbar() {
@@ -947,8 +1096,32 @@
       }
     });
 
+    var groupList = Zengin.groups(state.doc);
+    var groupSelect = null;
+    if (groupList.length > 1) {
+      groupSelect = h('select', {
+        class: 'select', style: 'height:29px;font-size:12px;max-width:260px',
+        title: 'ヘッダー・レコード単位（口座単位）で絞り込みます',
+        onchange: function (event) {
+          state.groupIndex = event.target.value === '' ? null : parseInt(event.target.value, 10);
+          state.page = 1;
+          renderDataPanel();
+        }
+      }, [h('option', {
+        value: '', selected: state.groupIndex == null,
+        text: 'すべての口座（' + groupList.length + ' 組）'
+      })].concat(groupList.map(function (group) {
+        return h('option', {
+          value: String(group.index), selected: state.groupIndex === group.index,
+          text: (group.index + 1) + '. ' + Zengin.groupLabel(state.doc, group) +
+            '（' + group.data.length + ' 件）'
+        });
+      })));
+    }
+
     return h('div', { class: 'table-toolbar' }, [
       h('div', { class: 'search-box' }, [svg(ICON.search), searchInput]),
+      groupSelect,
       h('button', {
         type: 'button', class: 'btn btn-sm',
         onclick: addDataRow
@@ -1474,7 +1647,7 @@
         svg(ICON.check),
         h('div', null, [
           h('strong', { text: '問題は見つかりませんでした' }),
-          h('span', { text: 'レコード構成・桁数・文字種・必須項目・合計金額のすべてが整合しています。' })
+          h('span', { text: validatedScopeText() })
         ])
       ]));
       return;
@@ -1562,36 +1735,45 @@
 
   function exportZengin() {
     var doc = state.doc;
-    var counts = Zengin.countByLevel(state.issues);
-    var run = function () {
+    var summary = Zengin.summarize(doc);
+    confirmExport({
+      meta: [
+        ['形式', doc.format.name + '（種別コード ' + doc.format.code + '・' + doc.recordLength + ' 桁）'],
+        ['レコード数', num(doc.records.length) + ' 件（うちデータ ' + num(summary.count) + ' 件）'],
+        ['文字コード / 改行', Charset.getCodec(doc.encoding).label + ' / ' +
+          (doc.lineEnding === 'NONE' ? '改行なし' : doc.lineEnding)]
+      ]
+    }).then(function (ok) {
+      if (!ok) return;
       var bytes = Zengin.serialize(doc, { encoding: doc.encoding, lineEnding: doc.lineEnding });
       download(bytes, baseFileName() + '_' + timestamp() + '.txt', 'text/plain');
       state.dirty = false;
       renderDocbar();
-      toast('全銀固定長で書き出しました',
-        doc.records.length + ' レコード / ' + formatBytes(bytes.length) + '（' +
-        Charset.getCodec(doc.encoding).label + '・' +
-        (doc.lineEnding === 'NONE' ? '改行なし' : doc.lineEnding) + '）', 'ok');
-    };
-
-    if (counts.error) {
-      confirmAction('エラーが ' + counts.error + ' 件あります。このまま書き出しますか？\n' +
-        '銀行で受け付けられない可能性があります。', '書き出す').then(function (ok) {
-        if (ok) run();
-      });
-    } else {
-      run();
-    }
+      toast('参考ファイルとして書き出しました',
+        doc.records.length + ' レコード / ' + formatBytes(bytes.length) +
+        '。提出前に金融機関の仕様書と照合してください。', 'ok');
+    });
   }
 
   function exportCsv() {
+    var doc = state.doc;
+    confirmExport({
+      meta: [
+        ['内容', 'データ・レコードの一覧（' + num(Zengin.summarize(doc).count) + ' 件）'],
+        ['文字コード', 'UTF-8（BOM 付き・Excel 対応）'],
+        ['用途', '確認・照合用。全銀形式へ戻す機能はありません']
+      ]
+    }).then(function (ok) { if (ok) writeCsv(); });
+  }
+
+  function writeCsv() {
     var doc = state.doc;
     var csv = Zengin.toCsv(doc, { includeDummy: state.showDummy });
     // 見出しに漢字を含むため Shift_JIS では表現できない。
     // 先頭に BOM を付けた UTF-8 にすると Excel でも文字化けせずに開ける。
     var bytes = new TextEncoder().encode('\uFEFF' + csv);
     download(bytes, baseFileName() + '_明細_' + timestamp() + '.csv', 'text/csv');
-    toast('CSV を書き出しました',
+    toast('参考ファイルとして CSV を書き出しました',
       Zengin.summarize(doc).count + ' 件（UTF-8 BOM 付き / Excel 対応）', 'ok');
   }
 
@@ -1671,6 +1853,13 @@
     $('#btn-help').addEventListener('click', function () {
       $('#help-dialog').showModal();
     });
+    var more = $('#btn-disclaimer-more');
+    if (more) {
+      more.addEventListener('click', function () {
+        show('disclaimer');
+        $('#help-dialog').showModal();
+      });
+    }
   }
 
   /* ================================================================
@@ -1679,18 +1868,31 @@
 
   function initSamples() {
     var host = $('#sample-chips');
-    host.replaceChildren.apply(host, Samples.CATALOG.map(function (entry) {
-      return h('button', {
-        type: 'button', class: 'sample-chip',
-        onclick: function () {
-          var bytes = Samples.build(entry.code, { withResult: entry.withResult });
-          loadBytes(bytes, 'サンプル_' + entry.label + '.txt');
-        }
-      }, [
-        h('strong', { text: entry.label }),
-        h('span', { text: entry.note })
-      ]);
-    }));
+    var groupNames = [];
+    Samples.CATALOG.forEach(function (entry) {
+      if (groupNames.indexOf(entry.group) < 0) groupNames.push(entry.group);
+    });
+
+    var nodes = [];
+    groupNames.forEach(function (name) {
+      nodes.push(h('div', { class: 'sample-group' }, [
+        h('span', { class: 'sample-group-label', text: name }),
+        h('div', { class: 'sample-group-items' },
+          Samples.CATALOG.filter(function (e) { return e.group === name; }).map(function (entry) {
+            return h('button', {
+              type: 'button', class: 'sample-chip',
+              onclick: function () {
+                var bytes = Samples.build(entry.code, { withResult: entry.withResult });
+                loadBytes(bytes, 'サンプル_' + entry.label + '.txt');
+              }
+            }, [
+              h('strong', { text: entry.label }),
+              h('span', { text: entry.note })
+            ]);
+          }))
+      ]));
+    });
+    host.replaceChildren.apply(host, nodes);
   }
 
   function initDragAndDrop() {

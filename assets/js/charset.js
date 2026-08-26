@@ -204,26 +204,88 @@
    * 全銀で使用できる文字
    * ------------------------------------------------------------------ */
 
-  // 全銀協制定の使用可能文字（半角）
-  var ZENGIN_SYMBOLS = ' 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ' + '¥().-/,';
-  var ZENGIN_CHARSET = (function () {
-    var set = Object.create(null);
-    var all = ZENGIN_SYMBOLS + HANKAKU_KANA;
-    for (var i = 0; i < all.length; i++) set[all.charAt(i)] = true;
-    return set;
-  })();
+  // 付録 1「使用文字一覧」（JIS の場合）に掲げられた記号
+  var ZENGIN_SYMBOLS = " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ" + "'():+,¥-./?｢｣";
+  // 大文字カナ・濁点・半濁点・長音（使用文字一覧に掲げられたカナ）
+  var ZENGIN_KANA = 'ｦｰ' + 'ｱｲｳｴｵｶｷｸｹｺｻｼｽｾｿﾀﾁﾂﾃﾄﾅﾆﾇﾈﾉﾊﾋﾌﾍﾎﾏﾐﾑﾒﾓﾔﾕﾖﾗﾘﾙﾚﾛﾜﾝ' + 'ﾞﾟ';
+  // 使用文字一覧には無いが、実務のファイルで見かける文字（警告扱い）
+  var ZENGIN_TOLERATED = 'ｧｨｩｪｫｬｭｮｯ｡､･';
 
-  function isZenginChar(ch) {
-    return ZENGIN_CHARSET[ch] === true;
+  function toSet(text) {
+    var set = Object.create(null);
+    for (var i = 0; i < text.length; i++) set[text.charAt(i)] = true;
+    return set;
   }
 
-  /** 文字列中の全銀標準外の文字を列挙する。 */
+  var BASE_CHARSET = toSet(ZENGIN_SYMBOLS + ZENGIN_KANA);
+  var TOLERATED_CHARSET = toSet(ZENGIN_TOLERATED);
+
+  /**
+   * 項目種別ごとの使用可能文字（付録 1 の注 1・注 3）。
+   *   name   … 口座名・振込依頼人名・受取人名・預金者名・会社名・委託者名など
+   *   branch … 店舗名（銀行名・支店名）
+   *   edi    … EDI 情報
+   * いずれも「カナ（ヲと小文字を除く）、濁点、半濁点」を含む。
+   */
+  var KANA_NO_WO = 'ｰ' + 'ｱｲｳｴｵｶｷｸｹｺｻｼｽｾｿﾀﾁﾂﾃﾄﾅﾆﾇﾈﾉﾊﾋﾌﾍﾎﾏﾐﾑﾒﾓﾔﾕﾖﾗﾘﾙﾚﾛﾜﾝ' + 'ﾞﾟ';
+  var UPPER_DIGIT = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+
+  var FIELD_CHARSETS = {
+    name: {
+      label: '口座名・氏名欄',
+      set: toSet(KANA_NO_WO + UPPER_DIGIT + ' ()-.'),
+      note: 'カナ（ヲと小文字を除く）・濁点・半濁点・英大文字・数字・スペース・記号 4 種類（ ( ) - . ）のみ'
+    },
+    branch: {
+      label: '店舗名欄',
+      set: toSet(KANA_NO_WO + UPPER_DIGIT + ' -'),
+      note: 'カナ（ヲと小文字を除く）・濁点・半濁点・英大文字・数字・記号 1 種類（ - ）のみ'
+    },
+    edi: {
+      label: 'EDI 情報欄',
+      set: toSet(KANA_NO_WO + 'ｦ' + UPPER_DIGIT + ' ¥｢｣()-/.'),
+      note: 'カナ（小文字を除く）・濁点・半濁点・英大文字・数字・スペース・記号 8 種類（ ¥ ｢ ｣ ( ) - / . ）のみ。カンマは区切り文字として使われるため使用しない'
+    }
+  };
+
+  function isZenginChar(ch) {
+    return BASE_CHARSET[ch] === true;
+  }
+
+  /** 使用文字一覧には無いが、読み込み自体は許容する文字か。 */
+  function isToleratedChar(ch) {
+    return TOLERATED_CHARSET[ch] === true;
+  }
+
+  /**
+   * 項目の内容が、その項目種別で許された文字だけで構成されているか調べる。
+   * @returns {{chars:string[], rule:object}|null} 違反があれば内容を返す
+   */
+  function checkFieldCharset(text, charClass) {
+    var rule = FIELD_CHARSETS[charClass];
+    if (!rule) return null;
+    var bad = [];
+    var seen = Object.create(null);
+    for (var i = 0; i < text.length; i++) {
+      var ch = text.charAt(i);
+      if (ch === ' ' || rule.set[ch]) continue;
+      if (seen[ch]) continue;
+      seen[ch] = true;
+      bad.push(ch);
+    }
+    return bad.length ? { chars: bad, rule: rule } : null;
+  }
+
+  /**
+   * 文字列中の、全銀フォーマットで扱えない文字を列挙する。
+   * 使用文字一覧には無いが実務で見かける文字（小文字カナなど）は含めない。
+   */
   function findInvalidChars(text) {
     var found = [];
     var seen = Object.create(null);
     for (var i = 0; i < text.length; i++) {
       var ch = text.charAt(i);
-      if (isZenginChar(ch)) continue;
+      if (isZenginChar(ch) || isToleratedChar(ch)) continue;
       var key = ch;
       if (seen[key]) continue;
       seen[key] = true;
@@ -331,14 +393,31 @@
     return out;
   }
 
+  /** 使用文字一覧に無い「許容文字」を列挙する（警告用）。 */
+  function findToleratedChars(text) {
+    var found = [];
+    var seen = Object.create(null);
+    for (var i = 0; i < text.length; i++) {
+      var ch = text.charAt(i);
+      if (!isToleratedChar(ch) || seen[ch]) continue;
+      seen[ch] = true;
+      found.push(ch);
+    }
+    return found;
+  }
+
   global.ZenginCharset = {
     PUA_BASE: PUA_BASE,
     HANKAKU_KANA: HANKAKU_KANA,
     ZENGIN_SYMBOLS: ZENGIN_SYMBOLS,
+    FIELD_CHARSETS: FIELD_CHARSETS,
     codecs: CODECS,
     getCodec: getCodec,
     detectEncoding: detectEncoding,
     isZenginChar: isZenginChar,
+    isToleratedChar: isToleratedChar,
+    checkFieldCharset: checkFieldCharset,
+    findToleratedChars: findToleratedChars,
     isPrivateUse: isPrivateUse,
     privateUseByte: privateUseByte,
     findInvalidChars: findInvalidChars,

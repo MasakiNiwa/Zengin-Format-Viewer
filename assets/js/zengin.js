@@ -136,6 +136,22 @@
     return String(parseInt(digits, 10)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
   }
 
+  function formatYymmdd(value) {
+    var v = String(value == null ? '' : value).replace(/\D/g, '');
+    if (v === '') return '';
+    if (v.length < 6) v = padLeft(v, 6, '0');
+    if (v.length !== 6) return String(value);
+    return v.slice(0, 2) + '/' + v.slice(2, 4) + '/' + v.slice(4, 6);
+  }
+
+  function formatHhmm(value) {
+    var v = String(value == null ? '' : value).replace(/\D/g, '');
+    if (v === '') return '';
+    if (v.length < 4) v = padLeft(v, 4, '0');
+    if (v.length !== 4) return String(value);
+    return v.slice(0, 2) + ':' + v.slice(2, 4);
+  }
+
   function formatMmdd(value) {
     var v = String(value == null ? '' : value).replace(/\D/g, '');
     if (v === '') return '';
@@ -149,6 +165,8 @@
     var value = readField(record, field);
     if (field.format === 'amount' || field.format === 'count') return formatAmount(value);
     if (field.format === 'mmdd') return formatMmdd(value);
+    if (field.format === 'yymmdd') return formatYymmdd(value);
+    if (field.format === 'hhmm') return formatHhmm(value);
     return Charset.toDisplay(value);
   }
 
@@ -253,10 +271,66 @@
       });
     }
 
+    // 同一種別コードでデータ・レコードのレイアウトが分かれるフォーマットの判定
+    if (format.variants) {
+      var headerDef = format.records.header;
+      var headerRecord = headerLine ? makeRecord(headerLine, 'header') : null;
+      var context = {
+        headerValue: function (key) {
+          var field = headerDef.byKey[key];
+          if (!field || !headerRecord) return '';
+          return readField(headerRecord, field);
+        },
+        dataSamples: lines.filter(function (line) {
+          return line.charAt(0) === '2';
+        }).slice(0, 20)
+      };
+      var variantKey = opts.variantKey ||
+        (format.selectVariant ? format.selectVariant(context) : format.variants[0].key);
+      format = Formats.withVariant(format, variantKey);
+      notices.push({
+        level: 'info',
+        message: format.name + 'のデータ・レコードを「' + format.variantLabel + '」として読み込みました。' +
+          (opts.variantKey ? '' : '（自動判定）')
+      });
+    }
+
+    // 規定のレコード長と食い違う場合も、ファイルの実際の長さを優先する。
+    // 規定側に合わせて切り詰めると、読み込んだだけでデータが失われてしまう。
+    if (!format.generic && format.recordLength !== recordLength) {
+      notices.push({
+        level: 'warn',
+        message: format.name + 'のレコード長は通常 ' + format.recordLength + ' 桁ですが、' +
+          'このファイルは ' + recordLength + ' 桁です。ファイルの長さのまま読み込みました。'
+      });
+    }
+
+    var shortLines = 0;
+    var longLines = 0;
     var records = lines.map(function (line) {
       var kind = KIND_BY_KUBUN[line.charAt(0)] || 'unknown';
-      return makeRecord(padRight(line, format.recordLength, ' ').slice(0, Math.max(line.length, format.recordLength)), kind);
+      if (line.length < recordLength) {
+        shortLines++;
+        line = padRight(line, recordLength, ' ');
+      } else if (line.length > recordLength) {
+        longLines++;
+      }
+      return makeRecord(line, kind);
     });
+    if (shortLines) {
+      notices.push({
+        level: 'info',
+        message: recordLength + ' 桁に満たないレコードが ' + shortLines +
+          ' 件あったため、末尾を空白で補いました。'
+      });
+    }
+    if (longLines) {
+      notices.push({
+        level: 'warn',
+        message: recordLength + ' 桁を超えるレコードが ' + longLines +
+          ' 件あります。内容はそのまま保持しています。'
+      });
+    }
 
     return {
       fileName: opts.fileName || '',
@@ -269,6 +343,7 @@
       formatOverridden: !!opts.formatCode && opts.formatCode !== typeCode,
       records: records,
       notices: notices,
+      variantKey: format.variantKey || null,
       byteLength: bytes.length
     };
   }
@@ -347,40 +422,169 @@
     return null;
   }
 
+  function fieldsByRole(recordDef, role) {
+    if (!recordDef) return [];
+    return recordDef.fields.filter(function (field) { return field.role === role; });
+  }
+
+  /**
+   * レコードの金額を求める。
+   * 振込入金通知フォーマット B のように金額欄が複数に分かれる場合があり、
+   * その場合は使われていない側がすべて「0」になるため、合計すればよい。
+   */
+  function amountOf(recordDef, record) {
+    var total = 0;
+    fieldsByRole(recordDef, 'amount').forEach(function (field) {
+      total += toNumber(readField(record, field));
+    });
+    return total;
+  }
+
   function recordsOfKind(doc, kind) {
     return doc.records.filter(function (r) { return r.kind === kind; });
   }
 
-  /** データレコードの件数と金額合計を集計する。 */
-  function summarize(doc) {
-    var dataDef = doc.format.records.data;
-    var amountField = fieldByRole(dataDef, 'amount');
-    var rows = recordsOfKind(doc, 'data');
-    var total = 0;
-    if (amountField) {
-      rows.forEach(function (rec) { total += toNumber(readField(rec, amountField)); });
-    }
-    return { count: rows.length, amount: total, amountField: amountField };
+  /**
+   * ヘッダー → データ… → トレーラ のまとまり（グループ）に分ける。
+   *
+   * 全銀協の規定では 1 ファイルに複数のヘッダー・レコードを含めてよい
+   * （残高通知や入出金取引明細では口座ごとにグループが並ぶ）。
+   * 合計件数・合計金額はグループ単位で突き合わせる必要がある。
+   */
+  function groups(doc) {
+    var result = [];
+    var current = null;
+    var open = function (index) {
+      current = { header: null, headerIndex: -1, data: [], trailer: null, trailerIndex: -1, index: result.length };
+      result.push(current);
+      return current;
+    };
+    doc.records.forEach(function (rec, index) {
+      if (rec.kind === 'header') {
+        current = open(index);
+        current.header = rec;
+        current.headerIndex = index;
+      } else if (rec.kind === 'data') {
+        if (!current) current = open(index);
+        current.data.push(rec);
+      } else if (rec.kind === 'trailer') {
+        if (!current) current = open(index);
+        current.trailer = rec;
+        current.trailerIndex = index;
+        current = null; // トレーラでグループを閉じる
+      }
+    });
+    return result;
   }
 
-  /** トレーラーレコードの合計件数・合計金額をデータから再計算する。 */
-  function recalcTrailer(doc) {
-    var sum = summarize(doc);
-    var trailerDef = doc.format.records.trailer;
+  /** グループを人が読める見出しにする（口座単位の切り替え用）。 */
+  function groupLabel(doc, group) {
+    if (!group.header) return 'グループ ' + (group.index + 1);
+    var def = doc.format.records.header;
+    var parts = [];
+    ['originBranchCode', 'originBranchName'].forEach(function (role) {
+      var field = fieldByRole(def, role);
+      if (field) {
+        var value = readField(group.header, field);
+        if (value) parts.push(value);
+      }
+    });
+    var depositField = fieldByRole(def, 'depositType');
+    if (depositField) {
+      var label = codeLabel(depositField, readField(group.header, depositField));
+      if (label) parts.push(label);
+    }
+    var accountField = fieldByRole(def, 'accountNumber');
+    if (accountField) {
+      var account = readField(group.header, accountField);
+      if (account) parts.push(account);
+    }
+    return parts.length ? parts.join(' ') : 'グループ ' + (group.index + 1);
+  }
+
+  /** データレコードの件数と金額合計を集計する（ファイル全体）。 */
+  function summarize(doc) {
+    var dataDef = doc.format.records.data;
+    var amountFields = fieldsByRole(dataDef, 'amount');
+    var rows = recordsOfKind(doc, 'data');
+    var total = 0;
+    rows.forEach(function (rec) { total += amountOf(dataDef, rec); });
+    return {
+      count: rows.length, amount: total,
+      amountField: amountFields[0] || null, amountFields: amountFields
+    };
+  }
+
+  /**
+   * トレーラで突き合わせる集計項目の一覧。
+   * フォーマットが aggregates を持たない場合は totalCount / totalAmount から導く。
+   */
+  function aggregateSpecs(format) {
+    if (format.aggregates) return format.aggregates;
+    var trailerDef = format.records.trailer;
     var countField = fieldByRole(trailerDef, 'totalCount');
     var amountField = fieldByRole(trailerDef, 'totalAmount');
-    var updated = 0;
-    recordsOfKind(doc, 'trailer').forEach(function (rec) {
-      if (countField) setField(rec, countField, String(sum.count));
-      if (amountField) setField(rec, amountField, String(sum.amount));
-      updated++;
+    if (!countField && !amountField) return [];
+    return [{
+      label: '合計',
+      countKey: countField ? countField.key : null,
+      amountKey: amountField ? amountField.key : null
+    }];
+  }
+
+  /** 与えられたデータレコード群を、集計仕様にしたがって集計する。 */
+  function computeAggregates(doc, dataRecords) {
+    var dataDef = doc.format.records.data;
+    var hasAmountField = fieldsByRole(dataDef, 'amount').length > 0;
+    return aggregateSpecs(doc.format).map(function (spec) {
+      var rows = dataRecords;
+      if (spec.where) {
+        var whereField = dataDef.byKey[spec.where.key];
+        rows = whereField
+          ? rows.filter(function (rec) { return readField(rec, whereField).trim() === spec.where.equals; })
+          : [];
+      }
+      var amount = 0;
+      var hasAmount = !!(spec.amountKey && hasAmountField);
+      if (hasAmount) {
+        rows.forEach(function (rec) { amount += amountOf(dataDef, rec); });
+      }
+      return { spec: spec, count: rows.length, amount: amount, hasAmount: hasAmount };
     });
-    return { updated: updated, count: sum.count, amount: sum.amount };
+  }
+
+  /** トレーラの合計欄を、同じグループのデータレコードから再計算する。 */
+  function recalcTrailer(doc) {
+    var trailerDef = doc.format.records.trailer;
+    var updated = 0;
+    var count = 0;
+    var amount = 0;
+    groups(doc).forEach(function (group) {
+      if (!group.trailer) return;
+      computeAggregates(doc, group.data).forEach(function (agg) {
+        var countField = agg.spec.countKey ? trailerDef.byKey[agg.spec.countKey] : null;
+        var amountField = agg.spec.amountKey ? trailerDef.byKey[agg.spec.amountKey] : null;
+        if (countField) setField(group.trailer, countField, String(agg.count));
+        if (amountField && agg.hasAmount) setField(group.trailer, amountField, String(agg.amount));
+      });
+      updated++;
+      count += group.data.length;
+    });
+    var sum = summarize(doc);
+    amount = sum.amount;
+    return { updated: updated, count: count, amount: amount };
   }
 
   /* ------------------------------------------------------------------ *
    * 検証
    * ------------------------------------------------------------------ */
+
+  /** 月日として妥当か（実在日までは判定しない）。 */
+  function validMonthDay(mm, dd) {
+    var m = parseInt(mm, 10);
+    var d = parseInt(dd, 10);
+    return m >= 1 && m <= 12 && d >= 1 && d <= 31;
+  }
 
   function issue(level, message, extra) {
     var it = { level: level, message: message, recordIndex: null, fieldKey: null, hint: '' };
@@ -419,6 +623,15 @@
           { recordIndex: index }));
       }
 
+      var tolerated = Charset.findToleratedChars(rec.text);
+      if (tolerated.length) {
+        issues.push(issue('warn', '全銀協の使用文字一覧に無い文字が含まれています: ' + tolerated.join(' '),
+          {
+            recordIndex: index,
+            hint: '小文字カナや「｡ ､ ･」は使用文字一覧に掲げられていません。金融機関によっては受け付けられない場合があります。'
+          }));
+      }
+
       var invalid = Charset.findInvalidChars(rec.text);
       if (invalid.length) {
         var samples = invalid.slice(0, 5).map(function (v) { return v.display; }).join(' ');
@@ -426,7 +639,7 @@
           (invalid.length > 5 ? ' ほか' : ''),
         {
           recordIndex: index,
-          hint: '半角カナ・英大文字・数字・記号（ ( ) - . , / ¥ ）のみ使用できます。'
+          hint: '半角カナ（大文字）・英大文字・数字・スペースと、使用文字一覧に掲げられた記号のみ使用できます。'
         }));
       }
 
@@ -461,16 +674,40 @@
         }
         if (field.format === 'mmdd' && value !== '') {
           var mmdd = padLeft(value, 4, '0');
-          var mm = parseInt(mmdd.slice(0, 2), 10);
-          var dd = parseInt(mmdd.slice(2, 4), 10);
-          if (!(mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31)) {
+          if (!validMonthDay(mmdd.slice(0, 2), mmdd.slice(2, 4))) {
             issues.push(issue('error', def.label + 'の「' + field.label + '」が日付として不正です（' + mmdd + '）。',
               { recordIndex: index, fieldKey: field.key, hint: 'MMDD 形式の 4 桁で入力してください。' }));
           }
         }
-        if (field.format === 'amount' && field.role === 'amount' && toNumber(value) === 0) {
+        if (field.format === 'yymmdd' && value !== '') {
+          var ymd = padLeft(value, 6, '0');
+          if (!validMonthDay(ymd.slice(2, 4), ymd.slice(4, 6))) {
+            issues.push(issue('error', def.label + 'の「' + field.label + '」が日付として不正です（' + ymd + '）。',
+              { recordIndex: index, fieldKey: field.key, hint: 'YYMMDD 形式の 6 桁（年は和暦）で入力してください。' }));
+          }
+        }
+        if (field.format === 'hhmm' && value !== '') {
+          var hhmm = padLeft(value, 4, '0');
+          var hh = parseInt(hhmm.slice(0, 2), 10);
+          var mi = parseInt(hhmm.slice(2, 4), 10);
+          if (!(hh >= 0 && hh <= 23 && mi >= 0 && mi <= 59)) {
+            issues.push(issue('error', def.label + 'の「' + field.label + '」が時刻として不正です（' + hhmm + '）。',
+              { recordIndex: index, fieldKey: field.key, hint: 'HHMM 形式の 4 桁で入力してください。' }));
+          }
+        }
+        // 銀行へ提出するデータで金額が 0 円なのは、記入もれの可能性が高い
+        if (format.direction === 'submit' && field.role === 'amount' && toNumber(value) === 0) {
           issues.push(issue('warn', def.label + 'の「' + field.label + '」が 0 円です。',
             { recordIndex: index, fieldKey: field.key }));
+        }
+        // 付録 1「使用文字一覧」の注記による、項目種別ごとの制限
+        if (field.charClass && value !== '') {
+          var violation = Charset.checkFieldCharset(value, field.charClass);
+          if (violation) {
+            issues.push(issue('warn', def.label + 'の「' + field.label + '」に、' +
+              violation.rule.label + 'では使えない文字があります: ' + violation.chars.join(' '),
+            { recordIndex: index, fieldKey: field.key, hint: violation.rule.note }));
+          }
         }
       });
     });
@@ -483,7 +720,7 @@
     var dataCount = kinds.filter(function (k) { return k === 'data'; }).length;
 
     if (headerCount === 0) issues.push(issue('error', 'ヘッダーレコード（データ区分 1）がありません。'));
-    if (trailerCount === 0) issues.push(issue('error', 'トレーラーレコード（データ区分 8）がありません。'));
+    if (trailerCount === 0) issues.push(issue('error', 'トレーラ・レコード（データ区分 8）がありません。'));
     if (endCount === 0) issues.push(issue('error', 'エンドレコード（データ区分 9）がありません。'));
     if (dataCount === 0) issues.push(issue('warn', 'データレコード（データ区分 2）が 1 件もありません。'));
     if (kinds[0] !== 'header') {
@@ -492,16 +729,66 @@
     if (kinds[kinds.length - 1] !== 'end') {
       issues.push(issue('error', '末尾がエンドレコードではありません。', { recordIndex: kinds.length - 1 }));
     }
-    // ヘッダー -> データ -> トレーラー -> エンド の順序
-    var lastRank = -1;
+    // ヘッダー → データ… → トレーラ を 1 グループとし、その繰り返し＋エンドを許す。
+    // 全銀協の規定では 1 ファイルに複数のヘッダー・レコードを含めてよい。
+    var state = 'start';
     kinds.forEach(function (kind, index) {
-      var rank = KIND_ORDER.indexOf(kind);
-      if (rank < 0) return;
-      if (rank < lastRank) {
+      if (kind === 'unknown') return;
+      var ok = false;
+      if (kind === 'header') ok = (state === 'start' || state === 'closed');
+      else if (kind === 'data') ok = (state === 'header' || state === 'data');
+      else if (kind === 'trailer') ok = (state === 'header' || state === 'data');
+      else if (kind === 'end') ok = (state === 'closed');
+
+      if (!ok) {
         issues.push(issue('error', 'レコードの並び順が不正です（' + format.records[kind].label +
-          'が想定より後ろにあります）。', { recordIndex: index }));
+          'をここに置くことはできません）。',
+        {
+          recordIndex: index,
+          hint: 'ヘッダー(1) → データ(2)… → トレーラ(8) を 1 組とし、最後にエンド(9) を置きます。'
+        }));
       }
-      lastRank = Math.max(lastRank, rank);
+      if (kind === 'header') state = 'header';
+      else if (kind === 'data') state = 'data';
+      else if (kind === 'trailer') state = 'closed';
+      else if (kind === 'end') state = 'end';
+    });
+
+    var groupList = groups(doc);
+
+    // データ・レコードのレイアウトがグループごとに変わる場合の注意
+    if (format.variants && format.selectVariant && doc.variantKey) {
+      var headerDef2 = format.records.header;
+      groupList.forEach(function (group) {
+        if (!group.header) return;
+        var resolved = format.selectVariant({
+          headerValue: function (key) {
+            var field = headerDef2.byKey[key];
+            return field ? readField(group.header, field) : '';
+          },
+          dataSamples: group.data.map(function (r) { return r.text; }).slice(0, 20)
+        });
+        if (resolved !== doc.variantKey) {
+          issues.push(issue('warn', (group.index + 1) + ' 組目は、ファイル全体とは別のレイアウト' +
+            '（' + resolved + '）が想定されるレコードです。',
+          {
+            recordIndex: group.headerIndex,
+            hint: 'このグループの項目は正しく解釈できていない可能性があります。' +
+              '「生データ」タブで桁位置をご確認ください。'
+          }));
+        }
+      });
+    }
+
+    groupList.forEach(function (group) {
+      if (!group.header) {
+        issues.push(issue('error', (group.index + 1) + ' 組目にヘッダー・レコードがありません。',
+          { recordIndex: group.data.length ? doc.records.indexOf(group.data[0]) : null }));
+      }
+      if (!group.trailer) {
+        issues.push(issue('error', (group.index + 1) + ' 組目にトレーラ・レコードがありません。',
+          { recordIndex: group.headerIndex >= 0 ? group.headerIndex : null }));
+      }
     });
 
     // --- 種別コードの整合 -------------------------------------------
@@ -517,36 +804,44 @@
       });
     }
 
-    // --- 合計件数・合計金額の突合 -----------------------------------
-    var sum = summarize(doc);
+    // --- 合計件数・合計金額の突合（グループ単位）--------------------
     var trailerDef = format.records.trailer;
-    var countField = fieldByRole(trailerDef, 'totalCount');
-    var amountField = fieldByRole(trailerDef, 'totalAmount');
-    recordsOfKind(doc, 'trailer').forEach(function (rec) {
-      var recIndex = doc.records.indexOf(rec);
-      if (countField) {
-        var declared = toNumber(readField(rec, countField));
-        if (declared !== sum.count) {
-          issues.push(issue('error', 'トレーラーの合計件数（' + formatAmount(declared) +
-            ' 件）がデータレコード件数（' + formatAmount(sum.count) + ' 件）と一致しません。',
-          { recordIndex: recIndex, fieldKey: countField.key, hint: '「合計を再計算」で自動修正できます。' }));
+    groupList.forEach(function (group) {
+      if (!group.trailer) return;
+      var recIndex = group.trailerIndex;
+      computeAggregates(doc, group.data).forEach(function (agg) {
+        var countField = agg.spec.countKey ? trailerDef.byKey[agg.spec.countKey] : null;
+        var amountField = agg.spec.amountKey ? trailerDef.byKey[agg.spec.amountKey] : null;
+        var prefix = groupList.length > 1 ? (group.index + 1) + ' 組目の' : '';
+
+        if (countField) {
+          var declared = toNumber(readField(group.trailer, countField));
+          if (declared !== agg.count) {
+            issues.push(issue('error', prefix + 'トレーラの「' + countField.label + '」（' +
+              formatAmount(declared) + ' 件）が、実際の ' + agg.spec.label + '件数（' +
+              formatAmount(agg.count) + ' 件）と一致しません。',
+            { recordIndex: recIndex, fieldKey: countField.key, hint: '「合計を再計算」で自動修正できます。' }));
+          }
         }
-      }
-      if (amountField && sum.amountField) {
-        var declaredAmount = toNumber(readField(rec, amountField));
-        if (declaredAmount !== sum.amount) {
-          issues.push(issue('error', 'トレーラーの合計金額（' + formatAmount(declaredAmount) +
-            ' 円）がデータレコードの合計（' + formatAmount(sum.amount) + ' 円）と一致しません。',
-          { recordIndex: recIndex, fieldKey: amountField.key, hint: '「合計を再計算」で自動修正できます。' }));
+        if (amountField && agg.hasAmount) {
+          var declaredAmount = toNumber(readField(group.trailer, amountField));
+          if (declaredAmount !== agg.amount) {
+            issues.push(issue('error', prefix + 'トレーラの「' + amountField.label + '」（' +
+              formatAmount(declaredAmount) + ' 円）が、実際の ' + agg.spec.label + '合計（' +
+              formatAmount(agg.amount) + ' 円）と一致しません。',
+            { recordIndex: recIndex, fieldKey: amountField.key, hint: '「合計を再計算」で自動修正できます。' }));
+          }
         }
-      }
-      // 預金口座振替の結果ファイル: 振替済 + 振替不能 = 合計
+      });
+
+      // 預金口座振替: 振替済 + 振替不能 = 合計
       var doneCount = trailerDef.byKey.doneCount;
       var failCount = trailerDef.byKey.failCount;
-      if (doneCount && failCount) {
-        var dc = toNumber(readField(rec, doneCount));
-        var fc = toNumber(readField(rec, failCount));
-        var tc = countField ? toNumber(readField(rec, countField)) : 0;
+      var totalCountField = trailerDef.byKey.totalCount;
+      if (doneCount && failCount && totalCountField) {
+        var dc = toNumber(readField(group.trailer, doneCount));
+        var fc = toNumber(readField(group.trailer, failCount));
+        var tc = toNumber(readField(group.trailer, totalCountField));
         if ((dc || fc) && dc + fc !== tc) {
           issues.push(issue('warn', '振替済件数（' + dc + '）と振替不能件数（' + fc +
             '）の合計が、合計件数（' + tc + '）と一致しません。',
@@ -621,7 +916,13 @@
     displayValue: displayValue,
     codeLabel: codeLabel,
     fieldByRole: fieldByRole,
+    fieldsByRole: fieldsByRole,
+    amountOf: amountOf,
     recordsOfKind: recordsOfKind,
+    groups: groups,
+    groupLabel: groupLabel,
+    aggregateSpecs: aggregateSpecs,
+    computeAggregates: computeAggregates,
     summarize: summarize,
     recalcTrailer: recalcTrailer,
     validate: validate,
