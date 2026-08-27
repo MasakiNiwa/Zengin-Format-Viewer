@@ -8,6 +8,7 @@
   var Charset = window.ZenginCharset;
   var Formats = window.ZenginFormats;
   var Samples = window.ZenginSamples;
+  var Charts = window.ZenginCharts;
   var Help = window.ZenginHelp;
 
   /* ================================================================
@@ -249,6 +250,7 @@
     issues: [],
     issuesByRecord: {},
     dirty: false,
+    readonly: true,     // 既定は閲覧専用。明示的に切り替えたときだけ編集できる
     // データ明細
     page: 1,
     pageSize: 50,
@@ -302,6 +304,9 @@
       state.doc = doc;
       state.rawBytes = bytes;
       state.dirty = false;
+      state.readonly = true;
+      history.undo.length = 0;
+      history.redo.length = 0;
       state.baseline = snapshot(doc);
       state.page = 1;
       state.rawPage = 1;
@@ -346,6 +351,110 @@
   function guardUnsaved(action) {
     if (!state.dirty) return Promise.resolve(true);
     return confirmAction('編集中の内容は破棄されます。よろしいですか？', action || '破棄して続行');
+  }
+
+  /* ================================================================
+     変更履歴（元に戻す／やり直す）
+
+     レコードの参照をそのまま保持し、変わった内容だけを控える。
+     大きなファイルでも、1 操作あたりの控えは「並び順の配列＋変わった本文」で済む。
+     ================================================================ */
+
+  var history = { undo: [], redo: [], limit: 50 };
+
+  /** 編集できる状態か確かめる。閲覧モードなら理由を伝えて止める。 */
+  function requireEditable() {
+    if (!state.readonly) return true;
+    toast('いまは閲覧モードです', '内容を変更するには、画面上部の「編集を有効にする」を押してください。', 'info');
+    return false;
+  }
+
+  /**
+   * 文書を変更する操作を、元に戻せる形で実行する。
+   * @param {string} label   履歴に残す操作名
+   * @param {Function} fn    実際に文書を書き換える処理
+   * @returns {boolean} 変更があったか
+   */
+  function applyChange(label, fn) {
+    var doc = state.doc;
+    if (!doc) return false;
+    var beforeOrder = doc.records.slice();
+    var beforeTexts = doc.records.map(function (rec) { return rec.text; });
+
+    fn();
+
+    var patch = buildPatch(doc, beforeOrder, beforeTexts);
+    if (!patch) return false;
+    history.undo.push({ label: label, patch: patch });
+    if (history.undo.length > history.limit) history.undo.shift();
+    history.redo.length = 0;
+    markDirty();
+    return true;
+  }
+
+  function buildPatch(doc, beforeOrder, beforeTexts) {
+    var orderChanged = beforeOrder.length !== doc.records.length ||
+      beforeOrder.some(function (rec, i) { return doc.records[i] !== rec; });
+    var texts = [];
+    beforeOrder.forEach(function (rec, i) {
+      if (rec.text !== beforeTexts[i]) texts.push({ rec: rec, text: beforeTexts[i] });
+    });
+    if (!orderChanged && !texts.length) return null;
+    return { order: beforeOrder, texts: texts };
+  }
+
+  /** パッチを適用し、元に戻すための逆パッチを返す。 */
+  function revertPatch(patch) {
+    var doc = state.doc;
+    var currentOrder = doc.records.slice();
+    var currentTexts = patch.texts.map(function (entry) {
+      return { rec: entry.rec, text: entry.rec.text };
+    });
+    doc.records = patch.order.slice();
+    patch.texts.forEach(function (entry) { entry.rec.text = entry.text; });
+    return { order: currentOrder, texts: currentTexts };
+  }
+
+  function stepHistory(from, to, verb) {
+    if (!state.doc || !from.length) {
+      toast(verb + 'できる操作はありません', null, 'info');
+      return;
+    }
+    var entry = from.pop();
+    to.push({ label: entry.label, patch: revertPatch(entry.patch) });
+    state.selected = null;
+    markDirty();
+    renderAll();
+    toast(verb + 'ました', entry.label, 'ok');
+  }
+
+  function undoChange() { stepHistory(history.undo, history.redo, '元に戻し'); }
+  function redoChange() { stepHistory(history.redo, history.undo, 'やり直し'); }
+
+  /** 読み込んだ時点の内容に戻す。 */
+  function restoreBaseline() {
+    if (!state.doc || !state.baseline) return;
+    if (!computeDiff().total) {
+      toast('変更はありません', '読み込んだ時点のままです。', 'info');
+      return;
+    }
+    confirmAction('読み込んだ時点の内容に戻します。\nこれまでの編集はすべて取り消されます。よろしいですか？',
+      '読み込み時点へ戻す').then(function (ok) {
+      if (!ok) return;
+      applyChange('読み込み時点へ戻す', function () {
+        var byId = Object.create(null);
+        state.doc.records.forEach(function (rec) { byId[rec.id] = rec; });
+        state.doc.records = state.baseline.records.map(function (saved) {
+          var rec = byId[saved.id] || Zengin.makeRecord(saved.text, saved.kind);
+          rec.text = saved.text;
+          rec.kind = saved.kind;
+          return rec;
+        });
+      });
+      state.selected = null;
+      renderAll();
+      toast('読み込み時点へ戻しました', null, 'ok');
+    });
   }
 
   /* ================================================================
@@ -610,8 +719,9 @@
   }
 
   function markDirty() {
-    state.dirty = true;
     revalidate();
+    // 編集を取り消して元に戻れば、未保存の変更はなくなる
+    state.dirty = computeDiff().total > 0;
   }
 
   function fieldHasIssue(recordIndex, fieldKey) {
@@ -650,6 +760,7 @@
     renderRecordForm('header', $('#panel-header'));
     renderDataPanel();
     renderTrailerPanel();
+    renderAnalysis();
     renderRawPanel();
     renderIssuesPanel();
   }
@@ -670,7 +781,60 @@
 
   /* ---------------- 文書バー ---------------- */
 
+  var ICON_LOCK = 'M7 11V8a5 5 0 0 1 10 0v3M5 11h14v9H5z';
+  var ICON_PENCIL = 'M4 20h4L19 9a2 2 0 0 0-3-3L5 17z';
+  var ICON_UNDO = 'M9 14 4 9l5-5M4 9h9a7 7 0 0 1 0 14H8';
+  var ICON_REDO = 'm15 14 5-5-5-5m5 5h-9a7 7 0 0 0 0 14h5';
+
+  function enableEditing() {
+    state.readonly = false;
+    renderAll();
+    toast('編集を有効にしました',
+      '変更は「元に戻す」で取り消せます。「読み込み時点へ戻す」ですべて戻すこともできます。', 'ok');
+  }
+
+  function backToViewMode() {
+    state.readonly = true;
+    renderAll();
+    toast('閲覧モードに戻しました', '編集内容はそのまま残っています。', 'info');
+  }
+
+  /** 閲覧モードの切り替えと、元に戻す／やり直すの操作。 */
+  function renderModeBar() {
+    var host = $('#docbar-mode');
+    var children = [];
+
+    if (state.readonly) {
+      children.push(h('span', { class: 'mode-badge is-view' }, [svg(ICON_LOCK), '閲覧モード']));
+      children.push(h('button', {
+        type: 'button', class: 'btn btn-sm', id: 'btn-enable-edit', onclick: enableEditing
+      }, [icon(ICON_PENCIL), '編集を有効にする']));
+    } else {
+      children.push(h('span', { class: 'mode-badge is-edit' }, [svg(ICON_PENCIL), '編集中']));
+      children.push(h('button', {
+        type: 'button', class: 'btn btn-sm btn-icon', id: 'btn-undo',
+        title: '元に戻す（Ctrl+Z）' + (history.undo.length ? '：' + history.undo[history.undo.length - 1].label : ''),
+        disabled: !history.undo.length, onclick: undoChange
+      }, [icon(ICON_UNDO)]));
+      children.push(h('button', {
+        type: 'button', class: 'btn btn-sm btn-icon', id: 'btn-redo',
+        title: 'やり直す（Ctrl+Shift+Z）',
+        disabled: !history.redo.length, onclick: redoChange
+      }, [icon(ICON_REDO)]));
+      children.push(h('button', {
+        type: 'button', class: 'btn btn-sm', id: 'btn-restore-baseline',
+        title: '読み込んだ時点の内容に戻します',
+        disabled: !state.dirty, onclick: restoreBaseline
+      }, [icon(ICON.refresh), '読み込み時点へ戻す']));
+      children.push(h('button', {
+        type: 'button', class: 'btn btn-sm btn-ghost', id: 'btn-view-mode', onclick: backToViewMode
+      }, [icon(ICON_LOCK), '閲覧に戻す']));
+    }
+    host.replaceChildren.apply(host, children);
+  }
+
   function renderDocbar() {
+    renderModeBar();
     var doc = state.doc;
     var format = doc.format;
     var summary = Zengin.summarize(doc);
@@ -1203,6 +1367,274 @@
   }
 
   /* ================================================================
+     分析タブ
+
+     フォーマット定義のロールと属性から、そのファイルで意味のある切り口だけを
+     組み立てる。色は識別に使わず、分類名は必ず軸ラベルで示す。
+     ================================================================ */
+
+  var AMOUNT_BANDS = [
+    { limit: 10000, label: '〜1万円' },
+    { limit: 50000, label: '1万〜5万円' },
+    { limit: 100000, label: '5万〜10万円' },
+    { limit: 500000, label: '10万〜50万円' },
+    { limit: 1000000, label: '50万〜100万円' },
+    { limit: 5000000, label: '100万〜500万円' },
+    { limit: 10000000, label: '500万〜1000万円' },
+    { limit: Infinity, label: '1000万円〜' }
+  ];
+
+  /** 分析に使うデータ行（レコードと、その口座のレイアウト）。 */
+  function analysisRows() {
+    var doc = state.doc;
+    var defs = Zengin.dataDefMap(doc);
+    return Zengin.recordsOfKind(doc, 'data').map(function (rec) {
+      return { rec: rec, def: defs[rec.id] || doc.format.records.data };
+    });
+  }
+
+  function readBy(row, key) {
+    var field = row.def.byKey[key];
+    return field ? Zengin.readField(row.rec, field) : '';
+  }
+
+  /** 指定のキーでまとめ、件数と金額を集計する。 */
+  function groupRows(rows, keyOf, labelOf) {
+    var map = Object.create(null);
+    var order = [];
+    rows.forEach(function (row) {
+      var key = keyOf(row);
+      if (key == null) return;
+      if (!map[key]) {
+        map[key] = { key: key, label: labelOf(row, key), count: 0, amount: 0 };
+        order.push(key);
+      }
+      map[key].count++;
+      map[key].amount += Zengin.amountOf(row.def, row.rec);
+    });
+    return order.map(function (key) { return map[key]; });
+  }
+
+  function byAmountDesc(a, b) { return b.amount - a.amount || b.count - a.count; }
+
+  /** データ・レコードで最初に見つかる日付項目。 */
+  function dateFieldOf(def) {
+    for (var i = 0; i < def.fields.length; i++) {
+      var field = def.fields[i];
+      if (!field.dummy && (field.format === 'mmdd' || field.format === 'yymmdd')) return field;
+    }
+    return null;
+  }
+
+  function shortDate(field, raw) {
+    var digits = String(raw).replace(/\D/g, '');
+    if (field.format === 'yymmdd' && digits.length >= 6) {
+      return digits.slice(2, 4) + '/' + digits.slice(4, 6);
+    }
+    if (digits.length >= 4) return digits.slice(0, 2) + '/' + digits.slice(2, 4);
+    return raw;
+  }
+
+  function renderAnalysis() {
+    var panel = $('#panel-analysis');
+    var doc = state.doc;
+    var format = doc.format;
+
+    if (format.generic) {
+      panel.replaceChildren(h('div', { class: 'empty-state' }, [
+        h('strong', { text: 'このフォーマットは分析できません' }),
+        h('span', { text: 'レイアウト定義がないため、金額や日付を取り出せません。' })
+      ]));
+      return;
+    }
+
+    var rows = analysisRows();
+    if (!rows.length) {
+      panel.replaceChildren(h('div', { class: 'empty-state' }, [
+        h('strong', { text: 'データ・レコードがありません' }),
+        h('span', { text: '分析できる明細が含まれていません。' })
+      ]));
+      return;
+    }
+
+    var dataDef = rows[0].def;
+    var hasAmount = Zengin.fieldsByRole(dataDef, 'amount').length > 0;
+    var amountLabel = (Zengin.fieldByRole(dataDef, 'amount') || {}).label || '金額';
+    var wide = [];
+    var cards = [];
+
+    /* --- 日付別の推移 --- */
+    var dateField = dateFieldOf(dataDef);
+    var inOutField = Zengin.fieldByRole(dataDef, 'inOutKubun');
+    if (dateField && hasAmount) {
+      var byDate = Object.create(null);
+      var dates = [];
+      rows.forEach(function (row) {
+        var raw = readBy(row, dateField.key);
+        if (!raw) return;
+        var key = String(raw).replace(/\D/g, '');
+        if (!byDate[key]) {
+          byDate[key] = { key: key, label: shortDate(dateField, key), inAmount: 0, outAmount: 0 };
+          dates.push(key);
+        }
+        var amount = Zengin.amountOf(row.def, row.rec);
+        var kubun = inOutField ? Zengin.readField(row.rec, inOutField).trim() : '1';
+        if (kubun === '2') byDate[key].outAmount += amount;
+        else byDate[key].inAmount += amount;
+      });
+      dates.sort();
+      if (dates.length > 1) {
+        var series = [{ name: inOutField ? '入金' : amountLabel, slot: 1,
+          values: dates.map(function (k) { return byDate[k].inAmount; }) }];
+        if (inOutField) {
+          series.push({ name: '出金', slot: 2,
+            values: dates.map(function (k) { return byDate[k].outAmount; }) });
+        }
+        var chart = Charts.columnChart({
+          title: dateField.label + '別の' + amountLabel,
+          subtitle: 'ファイル全体（' + num(rows.length) + ' 件）を日付でまとめています',
+          categories: dates.map(function (k) { return byDate[k].label; }),
+          series: series, unit: '円', categoryLabel: dateField.label
+        });
+        if (series.length > 1) {
+          chart.insertBefore(Charts.legend(series), chart.querySelector('.chart-body'));
+        }
+        chart.classList.add('chart-wide');
+        wide.push(chart);
+      }
+    }
+
+    /* --- 金額帯別の件数 --- */
+    if (hasAmount) {
+      var bands = AMOUNT_BANDS.map(function (band) {
+        return { label: band.label, value: 0, amount: 0 };
+      });
+      rows.forEach(function (row) {
+        var amount = Zengin.amountOf(row.def, row.rec);
+        for (var i = 0; i < AMOUNT_BANDS.length; i++) {
+          if (amount < AMOUNT_BANDS[i].limit) { bands[i].value++; bands[i].amount += amount; break; }
+        }
+      });
+      var used = bands.filter(function (b) { return b.value > 0; });
+      if (used.length > 1) {
+        cards.push(Charts.barChart({
+          title: amountLabel + 'の分布',
+          subtitle: '金額帯ごとの件数',
+          rows: used.map(function (b) {
+            return { label: b.label, value: b.value, note: Charts.comma(b.amount) + ' 円' };
+          }),
+          unit: ' 件', categoryLabel: '金額帯', valueLabel: '件数', noteLabel: '金額合計',
+          labelWidth: 150
+        }));
+      }
+    }
+
+    /* --- 上位（名義別） --- */
+    var nameField = Zengin.fieldByRole(dataDef, 'name');
+    if (nameField && hasAmount) {
+      var byName = groupRows(rows,
+        function (row) { return readBy(row, nameField.key) || '（未設定）'; },
+        function (row, key) { return key; }).sort(byAmountDesc);
+      if (byName.length > 1) {
+        cards.push(Charts.barChart({
+          title: nameField.label + '別の' + amountLabel + '（上位 10）',
+          subtitle: '全 ' + num(byName.length) + ' 件のうち金額の大きい順',
+          rows: byName.slice(0, 10).map(function (g) {
+            return { label: g.label, value: g.amount, note: g.count + ' 件' };
+          }),
+          unit: ' 円', categoryLabel: nameField.label, valueLabel: amountLabel, noteLabel: '件数'
+        }));
+      }
+    }
+
+    /* --- 金融機関別 --- */
+    var bankCodeField = dataDef.byKey.bankCode;
+    if (bankCodeField && hasAmount) {
+      var byBank = groupRows(rows,
+        function (row) { return readBy(row, 'bankCode') || '（未設定）'; },
+        function (row, key) {
+          var name = readBy(row, 'bankName');
+          return name ? key + ' ' + name : key;
+        }).sort(byAmountDesc);
+      if (byBank.length > 1) {
+        cards.push(Charts.barChart({
+          title: bankCodeField.label.replace(/番号$/, '') + '別の' + amountLabel,
+          subtitle: num(byBank.length) + ' 金融機関',
+          rows: byBank.map(function (g) {
+            return { label: g.label, value: g.amount, note: g.count + ' 件' };
+          }),
+          unit: ' 円', categoryLabel: '金融機関', valueLabel: amountLabel, noteLabel: '件数'
+        }));
+      }
+    }
+
+    /* --- コード項目ごとの内訳 --- */
+    dataDef.fields.forEach(function (field) {
+      if (!field.codes || field.dummy || field.fixed != null) return;
+      if (inOutField && field.key === inOutField.key && dateField) return; // 推移で示している
+      var groups = groupRows(rows,
+        function (row) { return Zengin.readField(row.rec, field).trim() || '（未設定）'; },
+        function (row, key) {
+          var label = Zengin.codeLabel(field, key);
+          return label ? key + '：' + label : key;
+        });
+      if (groups.length < 2) return;
+      groups.sort(function (a, b) { return b.count - a.count; });
+      cards.push(Charts.barChart({
+        title: field.label + '別の件数',
+        subtitle: field.pos + '-' + field.end + ' 桁',
+        rows: groups.map(function (g) {
+          return {
+            label: g.label, value: g.count,
+            note: hasAmount ? Charts.comma(g.amount) + ' 円' : ''
+          };
+        }),
+        unit: ' 件', categoryLabel: field.label, valueLabel: '件数', noteLabel: '金額合計',
+        labelWidth: 210
+      }));
+    });
+
+    /* --- 口座別（複数グループ） --- */
+    var groupList = Zengin.groups(doc);
+    if (groupList.length > 1 && hasAmount) {
+      cards.push(Charts.barChart({
+        title: '口座別の' + amountLabel,
+        subtitle: num(groupList.length) + ' 組のヘッダーごと',
+        rows: groupList.map(function (group) {
+          var amount = 0;
+          group.data.forEach(function (rec) { amount += Zengin.amountOf(group.dataDef, rec); });
+          return {
+            label: Zengin.groupLabel(doc, group), value: amount,
+            note: group.data.length + ' 件'
+          };
+        }),
+        unit: ' 円', categoryLabel: '口座', valueLabel: amountLabel, noteLabel: '件数'
+      }));
+    }
+
+    var nodes = [];
+    nodes.push(h('div', { class: 'notice-card' }, [
+      h('span', { class: 'notice-icon' }, [svg(ICON.info)]),
+      h('div', { class: 'notice-body' }, [
+        h('strong', { text: '読み込んだファイルの内容をそのまま集計しています' }),
+        h('p', {
+          text: '各図の「表で見る」で、同じ内容を数値の表として確認できます。' +
+            'この集計はファイルの記載内容にもとづくもので、実際の取引や会計処理を保証するものではありません。'
+        })
+      ])
+    ]));
+    if (wide.length || cards.length) {
+      nodes.push(h('div', { class: 'analysis-grid' }, wide.concat(cards)));
+    } else {
+      nodes.push(h('div', { class: 'empty-state' }, [
+        h('strong', { text: '分析できる切り口が見つかりませんでした' }),
+        h('span', { text: '明細の件数が少ないか、集計できる項目がないファイルです。' })
+      ]));
+    }
+    panel.replaceChildren.apply(panel, nodes);
+  }
+
+  /* ================================================================
      項目フォーム（ヘッダー / トレーラ / エンド）
      ================================================================ */
 
@@ -1212,10 +1644,12 @@
     var control;
 
     var commit = function (raw) {
+      if (state.readonly) { requireEditable(); renderRecordForm('header', $('#panel-header')); renderTrailerPanel(); return; }
       var next = applyInputValue(field, raw);
       if (next === Zengin.readField(record, field)) return;
-      Zengin.setField(record, field, next);
-      markDirty();
+      applyChange(field.label + 'の変更', function () {
+        Zengin.setField(record, field, next);
+      });
       refreshAfterEdit({ rerenderData: true, rerenderForms: true });
     };
 
@@ -1232,7 +1666,7 @@
       }
       control = h('select', {
         class: 'field-input' + (issue ? ' has-error' : ''),
-        disabled: field.fixed != null ? true : null,
+        disabled: (field.fixed != null || state.readonly) ? true : null,
         title: field.fixed != null ? 'このレコードの種類を表す固定値です' : null,
         onchange: function (event) { commit(event.target.value); }
       }, options);
@@ -1242,7 +1676,7 @@
         class: 'field-input' + (field.type === 'N' ? ' is-numeric' : '') + (issue ? ' has-error' : ''),
         value: isAmount ? num(Zengin.toNumber(value)) : value,
         maxlength: field.type === 'N' && !isAmount ? field.len : null,
-        readonly: field.fixed != null ? true : null,
+        readonly: (field.fixed != null || state.readonly) ? true : null,
         onfocus: function (event) { if (isAmount) event.target.value = value; event.target.select(); },
         onblur: function (event) { commit(event.target.value); },
         onkeydown: function (event) { if (event.key === 'Enter') event.target.blur(); }
@@ -1352,7 +1786,7 @@
 
     var recalcBtn = h('button', {
       type: 'button', class: 'btn btn-sm btn-primary',
-      onclick: doRecalc
+      disabled: state.readonly, onclick: doRecalc
     }, [icon(ICON.refresh), '合計を再計算']);
 
     Zengin.recordsOfKind(doc, 'trailer').forEach(function (record, index) {
@@ -1372,12 +1806,13 @@
   }
 
   function doRecalc() {
-    var result = Zengin.recalcTrailer(state.doc);
-    if (!result.updated) {
+    if (!requireEditable()) return;
+    var result;
+    applyChange('合計の再計算', function () { result = Zengin.recalcTrailer(state.doc); });
+    if (!result || !result.updated) {
       toast('トレーラ・レコードがありません', '合計を書き込む先が見つかりませんでした。', 'warn');
       return;
     }
-    markDirty();
     renderAll();
     toast('合計を再計算しました',
       num(result.count) + ' 件 / ' + num(result.amount) + ' 円をトレーラに設定しました。', 'ok');
@@ -1448,20 +1883,26 @@
       });
     }
     if (state.sortKey) {
-      var field = currentDataDef().byKey[state.sortKey];
-      if (field) {
-        var dir = state.sortDir;
-        rows = rows.slice().sort(function (a, b) {
-          var va = Zengin.readField(a.rec, field);
-          var vb = Zengin.readField(b.rec, field);
-          if (field.type === 'N') {
-            return (Zengin.toNumber(va) - Zengin.toNumber(vb)) * dir;
-          }
-          return va.localeCompare(vb, 'ja') * dir;
-        });
+      var compare = sortComparator(currentDataDef());
+      if (compare) {
+        rows = rows.slice().sort(function (a, b) { return compare(a.rec, b.rec); });
       }
     }
     return rows;
+  }
+
+  /** 現在の並べ替え条件で、2 つのレコードを比べる関数を作る。 */
+  function sortComparator(def) {
+    if (!state.sortKey || !def) return null;
+    var field = def.byKey[state.sortKey];
+    if (!field) return null;
+    var dir = state.sortDir;
+    return function (a, b) {
+      var va = Zengin.readField(a, field);
+      var vb = Zengin.readField(b, field);
+      if (field.type === 'N') return (Zengin.toNumber(va) - Zengin.toNumber(vb)) * dir;
+      return va.localeCompare(vb, 'ja') * dir;
+    };
   }
 
   function visibleColumns() {
@@ -1544,20 +1985,20 @@
       groupSelect,
       h('button', {
         type: 'button', class: 'btn btn-sm',
-        onclick: addDataRow
+        disabled: state.readonly, onclick: addDataRow
       }, [icon(ICON.plus), '行を追加']),
       h('button', {
         type: 'button', class: 'btn btn-sm', id: 'btn-duplicate-row',
-        disabled: !state.selected,
+        disabled: state.readonly || !state.selected,
         onclick: duplicateSelectedRow
       }, [icon(ICON.copy), '複製']),
       h('button', {
         type: 'button', class: 'btn btn-sm btn-primary',
-        onclick: doRecalc
+        disabled: state.readonly, onclick: doRecalc
       }, [icon(ICON.refresh), '合計を再計算']),
       state.sortKey ? h('button', {
         type: 'button', class: 'btn btn-sm',
-        onclick: applySortToFile
+        disabled: state.readonly, onclick: applySortToFile
       }, [icon(ICON.sort), '並び順をファイルに反映']) : null,
 
       h('span', { class: 'toolbar-spacer' }),
@@ -1629,7 +2070,9 @@
       cells.push(h('td', { class: 'col-actions' }, [
         h('span', null, [
           h('button', {
-            type: 'button', class: 'row-btn', title: 'この行を削除',
+            type: 'button', class: 'row-btn',
+            title: state.readonly ? '閲覧モードでは削除できません' : 'この行を削除',
+            disabled: state.readonly,
             onclick: function () { deleteRow(row.rec); }
           }, [icon(ICON.trash, '')])
         ])
@@ -1729,70 +2172,137 @@
     renderDataPanel();
   }
 
+  /**
+   * 画面の並べ替えをファイルの並び順に反映する。
+   *
+   * データ・レコードは「ヘッダー → データ → トレーラ」の組の中だけで入れ替える。
+   * ヘッダー・トレーラ・エンドの位置は動かさないため、口座が複数あるファイルでも
+   * レコード構成が崩れない。
+   */
   function applySortToFile() {
-    var rows = filteredRows();
+    if (!state.sortKey) return;
     if (state.search) {
       toast('検索を解除してください', '絞り込み中は並び順を確定できません。', 'warn');
       return;
     }
     var doc = state.doc;
-    var sorted = rows.map(function (row) { return row.rec; });
-    var head = doc.records.filter(function (r) { return r.kind === 'header'; });
-    var tail = doc.records.filter(function (r) {
-      return r.kind !== 'header' && r.kind !== 'data';
-    });
-    doc.records = head.concat(sorted, tail);
-    state.sortKey = null;
-    markDirty();
-    renderAll();
-    toast('並び順をファイルに反映しました', 'データレコードの順序を書き出しに反映します。', 'ok');
+    var groupList = Zengin.groups(doc);
+    var target = state.groupIndex != null
+      ? groupList.filter(function (g) { return g.index === state.groupIndex; })
+      : groupList;
+    if (!target.length) return;
+
+    var label = state.groupIndex != null
+      ? Zengin.groupLabel(doc, target[0]) + ' の並び順'
+      : 'すべての口座の並び順';
+
+    confirmAction('データ・レコードの並び順をファイルに反映します（' + label + '）。\n' +
+      'ヘッダー・トレーラの位置は変わりません。よろしいですか？', '並び順を反映する')
+      .then(function (ok) {
+        if (!ok) return;
+        applyChange('並び順の反映', function () {
+          // レコードの位置を id で引けるようにしておく（大きなファイルでも速い）
+          var positionOf = Object.create(null);
+          doc.records.forEach(function (rec, index) { positionOf[rec.id] = index; });
+
+          target.forEach(function (group) {
+            var compare = sortComparator(group.dataDef);
+            if (!compare) return;
+            var slots = group.data.map(function (rec) { return positionOf[rec.id]; });
+            var sorted = group.data.slice().sort(compare);
+            slots.forEach(function (slot, i) { doc.records[slot] = sorted[i]; });
+          });
+        });
+        state.sortKey = null;
+        renderAll();
+        toast('並び順をファイルに反映しました',
+          'ヘッダー・トレーラの位置は変えずに、データ・レコードだけを並べ替えました。', 'ok');
+      });
   }
 
   /* ---------------- 行操作 ---------------- */
 
-  function insertDataRecord(record, afterRecord) {
+  function insertDataRecord(label, record, afterRecord) {
     var doc = state.doc;
-    var index;
-    if (afterRecord) {
-      index = doc.records.indexOf(afterRecord) + 1;
-    } else {
-      var rows = dataRows();
-      index = rows.length
-        ? rows[rows.length - 1].index + 1
-        : doc.records.findIndex(function (r) { return r.kind === 'trailer'; });
-      if (index < 0) index = doc.records.length;
-    }
-    doc.records.splice(index, 0, record);
-    markDirty();
+    applyChange(label, function () {
+      var index;
+      if (afterRecord) {
+        index = doc.records.indexOf(afterRecord) + 1;
+      } else {
+        // 選択中の口座（グループ）の末尾に入れる
+        var groupList = Zengin.groups(doc);
+        var group = state.groupIndex != null ? groupList[state.groupIndex] : null;
+        if (!group) {
+          for (var i = groupList.length - 1; i >= 0; i--) {
+            if (groupList[i].header) { group = groupList[i]; break; }
+          }
+        }
+        if (group && group.data.length) {
+          index = doc.records.indexOf(group.data[group.data.length - 1]) + 1;
+        } else if (group && group.trailer) {
+          index = doc.records.indexOf(group.trailer);
+        } else if (group && group.header) {
+          index = group.headerIndex + 1;
+        } else {
+          index = doc.records.findIndex(function (r) { return r.kind === 'trailer'; });
+          if (index < 0) index = doc.records.length;
+        }
+      }
+      doc.records.splice(index, 0, record);
+    });
     renderAll();
   }
 
   function addDataRow() {
-    insertDataRecord(Zengin.blankRecord(state.doc.format, 'data'));
+    if (!requireEditable()) return;
+    insertDataRecord('データ・レコードの追加',
+      Zengin.blankRecord(currentDataDefFormat(), 'data'));
     var rows = dataRows();
     state.page = Math.max(1, Math.ceil(rows.length / state.pageSize));
     renderDataPanel();
-    toast('データレコードを追加しました', '合計の再計算をお忘れなく。', 'ok');
+    toast('データ・レコードを追加しました', '合計の再計算をお忘れなく。', 'ok');
+  }
+
+  /** 追加する空レコードは、いま表示している口座のレイアウトに合わせる。 */
+  function currentDataDefFormat() {
+    var doc = state.doc;
+    var def = currentDataDef();
+    if (def === doc.format.records.data) return doc.format;
+    return { recordLength: doc.format.recordLength, records: { data: def } };
   }
 
   function duplicateSelectedRow() {
+    if (!requireEditable()) return;
     if (!state.selected) return;
     var source = findRecordById(state.selected.recordId);
     if (!source) return;
     var copy = Zengin.makeRecord(source.text, 'data');
-    insertDataRecord(copy, source);
+    insertDataRecord('行の複製', copy, source);
     toast('行を複製しました', '内容をそのままコピーしました。', 'ok');
   }
 
   function deleteRow(record) {
+    if (!requireEditable()) return;
     var doc = state.doc;
     var index = doc.records.indexOf(record);
     if (index < 0) return;
-    doc.records.splice(index, 1);
-    if (state.selected && state.selected.recordId === record.id) state.selected = null;
-    markDirty();
-    renderAll();
-    toast('行を削除しました', '合計の再計算をお忘れなく。', 'ok');
+    var def = Zengin.dataDefMap(doc)[record.id] || doc.format.records.data;
+    var nameField = Zengin.fieldByRole(def, 'name');
+    var amountFields = Zengin.fieldsByRole(def, 'amount');
+    var summary = [
+      nameField ? Zengin.readField(record, nameField) : '',
+      amountFields.length ? num(Zengin.amountOf(def, record)) + ' 円' : ''
+    ].filter(Boolean).join(' / ');
+
+    confirmAction('第 ' + (index + 1) + ' レコードを削除します。' +
+      (summary ? '\n' + summary : '') + '\n削除後も「元に戻す」で戻せます。', '削除する')
+      .then(function (ok) {
+        if (!ok) return;
+        applyChange('行の削除', function () { doc.records.splice(index, 1); });
+        if (state.selected && state.selected.recordId === record.id) state.selected = null;
+        renderAll();
+        toast('行を削除しました', '合計の再計算をお忘れなく。元に戻すこともできます。', 'ok');
+      });
   }
 
   function findRecordById(id) {
@@ -1814,6 +2324,7 @@
 
   function beginEdit(td, initialChar) {
     if (td.querySelector('.cell-editor')) return;
+    if (!requireEditable()) return;
     var record = findRecordById(td.dataset.rec);
     var field = currentDataDef().byKey[td.dataset.field];
     if (!record || !field) return;
@@ -1837,8 +2348,9 @@
       if (commit) {
         var next = applyInputValue(field, raw);
         if (next !== original) {
-          Zengin.setField(record, field, next);
-          markDirty();
+          applyChange(field.label + 'の変更', function () {
+            Zengin.setField(record, field, next);
+          });
         }
       }
       renderCellContent(td, record, field);
@@ -1901,11 +2413,13 @@
     if (key === 'Enter' || key === 'F2') { event.preventDefault(); beginEdit(td); return; }
     if (key === 'Delete' || key === 'Backspace') {
       event.preventDefault();
+      if (!requireEditable()) return;
       var record = findRecordById(td.dataset.rec);
       var field = currentDataDef().byKey[td.dataset.field];
-      if (record && field) {
-        Zengin.setField(record, field, '');
-        markDirty();
+      if (record && field && Zengin.readField(record, field) !== '') {
+        applyChange(field.label + 'の消去', function () {
+          Zengin.setField(record, field, '');
+        });
         renderCellContent(td, record, field);
         refreshAfterEdit({});
       }
@@ -2104,7 +2618,8 @@
     });
     if (hasTotals) {
       actions.push(h('button', {
-        type: 'button', class: 'btn btn-sm btn-primary', onclick: doRecalc
+        type: 'button', class: 'btn btn-sm btn-primary',
+        disabled: state.readonly, onclick: doRecalc
       }, [icon(ICON.refresh), '合計を再計算']));
     }
     var hasShort = issues.some(function (it) {
@@ -2112,19 +2627,23 @@
     });
     if (hasShort) {
       actions.push(h('button', {
-        type: 'button', class: 'btn btn-sm', id: 'btn-normalize-length', onclick: doNormalizeLengths
+        type: 'button', class: 'btn btn-sm', id: 'btn-normalize-length',
+        disabled: state.readonly, onclick: doNormalizeLengths
       }, [icon(ICON.check), 'レコード長をそろえる']));
     }
     return actions;
   }
 
   function doNormalizeLengths() {
-    var fixed = Zengin.normalizeRecordLengths(state.doc);
+    if (!requireEditable()) return;
+    var fixed = 0;
+    applyChange('レコード長をそろえる', function () {
+      fixed = Zengin.normalizeRecordLengths(state.doc);
+    });
     if (!fixed) {
       toast('補うレコードはありませんでした', null, 'info');
       return;
     }
-    markDirty();
     renderAll();
     toast('レコード長をそろえました',
       num(fixed) + ' 件のレコードの末尾を空白で補いました。', 'ok');
@@ -2219,27 +2738,34 @@
     });
   }
 
-  function exportCsv() {
+  function exportCsv(excel) {
     if (blockedByEbcdic()) return;
     var doc = state.doc;
+    var layouts = Zengin.hasMixedVariants(doc)
+      ? 'レイアウトごとに区切って出力します'
+      : '1 つの表として出力します';
     confirmExport({
       meta: [
-        ['内容', 'データ・レコードの一覧（' + num(Zengin.summarize(doc).count) + ' 件）'],
-        ['文字コード', 'UTF-8（BOM 付き・Excel 対応）'],
+        ['内容', 'データ・レコードの一覧（' + num(Zengin.summarize(doc).count) + ' 件）／' + layouts],
+        ['形式', excel
+          ? 'Excel 用（先頭 0 が消えないよう ="0009" の形で出力）'
+          : '標準（値をそのまま出力）'],
+        ['文字コード', 'UTF-8（BOM 付き）'],
         ['用途', '確認・照合用。全銀形式へ戻す機能はありません']
       ]
-    }).then(function (ok) { if (ok) writeCsv(); });
+    }).then(function (ok) { if (ok) writeCsv(excel); });
   }
 
-  function writeCsv() {
+  function writeCsv(excel) {
     var doc = state.doc;
-    var csv = Zengin.toCsv(doc, { includeDummy: state.showDummy });
+    var csv = Zengin.toCsv(doc, { includeDummy: state.showDummy, excel: excel });
     // 見出しに漢字を含むため Shift_JIS では表現できない。
     // 先頭に BOM を付けた UTF-8 にすると Excel でも文字化けせずに開ける。
     var bytes = new TextEncoder().encode('\uFEFF' + csv);
-    download(bytes, baseFileName() + '_明細_' + timestamp() + '.csv', 'text/csv');
+    download(bytes, baseFileName() + '_明細' + (excel ? '_Excel用' : '') + '_' +
+      timestamp() + '.csv', 'text/csv');
     toast('参考ファイルとして CSV を書き出しました',
-      Zengin.summarize(doc).count + ' 件（UTF-8 BOM 付き / Excel 対応）', 'ok');
+      Zengin.summarize(doc).count + ' 件（' + (excel ? 'Excel 用' : '標準') + ' / UTF-8 BOM 付き）', 'ok');
   }
 
   /* ================================================================
@@ -2427,6 +2953,23 @@
     initMenus();
     initHelp();
 
+    $('#btn-home').addEventListener('click', function () {
+      guardUnsaved('ホームに戻る').then(function (ok) {
+        if (!ok) return;
+        state.doc = null;
+        state.rawBytes = null;
+        state.baseline = null;
+        state.dirty = false;
+        state.issues = [];
+        state.issuesByRecord = {};
+        history.undo.length = 0;
+        history.redo.length = 0;
+        document.body.dataset.view = 'welcome';
+        $('#workspace').hidden = true;
+        setTab('summary');
+        window.scrollTo(0, 0);
+      });
+    });
     $('#btn-open').addEventListener('click', function () {
       guardUnsaved('読み込む').then(function (ok) { if (ok) $('#file-input').click(); });
     });
@@ -2439,7 +2982,8 @@
     });
     $('#diff-close').addEventListener('click', function () { $('#diff-dialog').close(); });
     $('#btn-save-zengin').addEventListener('click', requireDoc(exportZengin));
-    $('#btn-save-csv').addEventListener('click', requireDoc(exportCsv));
+    $('#btn-save-csv').addEventListener('click', requireDoc(function () { exportCsv(true); }));
+    $('#btn-save-csv-plain').addEventListener('click', requireDoc(function () { exportCsv(false); }));
 
     $('#tabs').addEventListener('click', function (event) {
       var tab = event.target.closest('.tab');
@@ -2453,6 +2997,15 @@
         if (state.doc) exportZengin();
       }
       if (event.key === 'F1') { event.preventDefault(); $('#help-dialog').showModal(); }
+      if (!state.doc || state.readonly) return;
+      var mod = event.ctrlKey || event.metaKey;
+      if (mod && event.key.toLowerCase() === 'z') {
+        event.preventDefault();
+        if (event.shiftKey) redoChange(); else undoChange();
+      } else if (mod && event.key.toLowerCase() === 'y') {
+        event.preventDefault();
+        redoChange();
+      }
     });
 
     window.addEventListener('beforeunload', function (event) {
@@ -2461,6 +3014,15 @@
       event.returnValue = '';
     });
   }
+
+  // 動作確認（tools/browser-test.mjs）から内部状態を読むための入口
+  window.__zenginDoc = function () { return state.doc; };
+  window.__zenginKinds = function () {
+    return state.doc ? state.doc.records.map(function (r) { return r.kind.charAt(0); }).join('') : '';
+  };
+  window.__zenginDataCount = function () {
+    return state.doc ? Zengin.recordsOfKind(state.doc, 'data').length : 0;
+  };
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', init);

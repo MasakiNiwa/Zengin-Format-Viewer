@@ -550,6 +550,33 @@ console.log('\nCSV 出力');
   const lines = csv.trim().split('\r\n');
   check('見出し + データ件数分の行', lines.length === 1 + Zengin.summarize(doc).count);
   check('見出しに受取人名を含む', lines[0].includes('受取人名'));
+  check('データ区分の列は出さない', !lines[0].includes('データ区分'));
+  check('標準は値をそのまま出す', lines[1].startsWith('1,0010,'), lines[1].slice(0, 30));
+
+  const excel = Zengin.toCsv(doc, { excel: true }).trim().split('\r\n');
+  check('Excel 用は先頭 0 を保つ', excel[1].includes('="0010"'), excel[1].slice(0, 60));
+  check('Excel 用でも口座番号は文字列', excel[1].includes('="4435232"'));
+  check('Excel 用でも金額は数値のまま', /,716080,/.test(excel[1]), excel[1]);
+
+  // 口座ごとにレイアウトが違うファイルは、レイアウトごとに区切る
+  const codec = Charset.getCodec('shift_jis');
+  const timeFmt = Formats.withVariant(Formats.getFormat('03'), 'time');
+  const base = codec.decode(Samples.build('03')).split('\r\n').filter(Boolean);
+  const header2 = Zengin.blankRecord(timeFmt, 'header');
+  Zengin.setField(header2, timeFmt.records.header.byKey.depositType, '6');
+  Zengin.setField(header2, timeFmt.records.header.byKey.reserved, '0');
+  const data2 = Zengin.blankRecord(timeFmt, 'data');
+  Zengin.setField(data2, timeFmt.records.data.byKey.rate, '000100');
+  const trailer2 = Zengin.blankRecord(timeFmt, 'trailer');
+  const mixedDoc = Zengin.parse(codec.encode(
+    base.slice(0, -1).concat([header2.text, data2.text, trailer2.text, base[base.length - 1]])
+      .join('\r\n') + '\r\n'), {});
+  const mixedCsv = Zengin.toCsv(mixedDoc);
+  check('混在レイアウトはレイアウトごとに区切る', (mixedCsv.match(/^■ /gm) || []).length === 2,
+    String((mixedCsv.match(/^■ /gm) || []).length));
+  check('流動性の見出しが出る', mixedCsv.includes('振込依頼人名・契約者番号'));
+  check('定期性の見出しが出る', mixedCsv.includes('利率'));
+  check('見出しは混ざらない', !mixedCsv.split('■')[1].includes('利率'));
 }
 
 console.log(`\n${failures === 0 ? '✅ すべて成功' : `❌ ${failures} 件失敗`}`);

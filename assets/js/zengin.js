@@ -1165,22 +1165,86 @@
     return text;
   }
 
-  /** データレコードを CSV 文字列に変換する。 */
+  /**
+   * Excel で開いたときに値が変わらない形にする。
+   *
+   * 銀行番号「0009」や口座番号「0012345」をそのまま書くと、Excel が数値と解釈して
+   * 先頭の 0 を落としてしまう。文字列であることを示す ="..." の形で書くと防げる。
+   * 金額と件数は集計できるよう、数値のまま出す。
+   */
+  function excelCell(field, value) {
+    if (field.format === 'amount' || field.format === 'count') {
+      return value === '' ? '' : String(toNumber(value));
+    }
+    if (value === '') return '';
+    // カンマや引用符を含む値は ="..." の形にできないため、通常の CSV 引用に任せる
+    if (/[",\r\n]/.test(value)) return csvEscape(value);
+    return '="' + value + '"';
+  }
+
+  /**
+   * データ・レコードを CSV 文字列に変換する。
+   *
+   * 口座ごとにレイアウトが異なるファイル（入出金取引明細の普通預金と定期預金など）
+   * では、1 つの見出し行に収められないため、レイアウトごとに区切って出力する。
+   *
+   * @param {object} doc
+   * @param {{includeDummy?:boolean, excel?:boolean}} [options]
+   *   excel=true で、先頭の 0 が消えないよう文字列として書き出す
+   */
   function toCsv(doc, options) {
     var opts = options || {};
-    var def = doc.format.records.data;
-    var fields = def.fields.filter(function (fd) {
-      return opts.includeDummy ? true : !fd.dummy;
-    });
-    var lines = [];
-    lines.push(['行番号'].concat(fields.map(function (fd) { return fd.label; })).map(csvEscape).join(','));
+    var defs = dataDefMap(doc);
+    var fallback = doc.format.records.data;
+
+    // レイアウトごとにデータ・レコードをまとめる
+    var buckets = [];
     var no = 0;
     doc.records.forEach(function (rec) {
       if (rec.kind !== 'data') return;
       no++;
-      var cells = [String(no)];
-      fields.forEach(function (fd) { cells.push(readField(rec, fd)); });
-      lines.push(cells.map(csvEscape).join(','));
+      var def = defs[rec.id] || fallback;
+      var bucket = null;
+      for (var i = 0; i < buckets.length; i++) {
+        if (buckets[i].def === def) { bucket = buckets[i]; break; }
+      }
+      if (!bucket) {
+        bucket = { def: def, rows: [] };
+        buckets.push(bucket);
+      }
+      bucket.rows.push({ no: no, rec: rec });
+    });
+    if (!buckets.length) buckets.push({ def: fallback, rows: [] });
+
+    var variantLabel = function (def) {
+      var variants = doc.format.variants || [];
+      for (var i = 0; i < variants.length; i++) {
+        if (variants[i].data === def) return variants[i].label;
+      }
+      return null;
+    };
+
+    var lines = [];
+    buckets.forEach(function (bucket, index) {
+      if (buckets.length > 1) {
+        if (index) lines.push('');
+        var label = variantLabel(bucket.def);
+        lines.push(csvEscape('■ ' + (label || 'レイアウト ' + (index + 1)) +
+          '（' + bucket.rows.length + ' 件）'));
+      }
+      var fields = bucket.def.fields.filter(function (fd) {
+        return opts.includeDummy ? true : !fd.hideInTable;
+      });
+      lines.push(['行番号'].concat(fields.map(function (fd) { return fd.label; }))
+        .map(csvEscape).join(','));
+      bucket.rows.forEach(function (row) {
+        var cells = [String(row.no)];
+        fields.forEach(function (fd) {
+          var value = readField(row.rec, fd);
+          cells.push(opts.excel ? excelCell(fd, value) : csvEscape(value));
+        });
+        lines.push(cells.join(','));
+      });
     });
     return lines.join('\r\n') + '\r\n';
   }
