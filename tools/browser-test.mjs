@@ -50,6 +50,14 @@ const check = (name, cond, detail = '') => {
   else { failures++; console.log(`  FAIL ${name}${detail ? ` — ${detail}` : ''}`); }
 };
 
+/** 既定は閲覧モードなので、編集する前に有効にする。 */
+const enableEdit = async (target) => {
+  if (await target.locator('#btn-enable-edit').count()) {
+    await target.locator('#btn-enable-edit').click();
+    await target.waitForTimeout(250);
+  }
+};
+
 const browser = await chromium.launch(
   process.env.CHROMIUM_PATH ? { executablePath: process.env.CHROMIUM_PATH } : {});
 const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
@@ -86,6 +94,24 @@ try {
     check(`${tab} タブ`, await page.locator(`#panel-${tab} ${sel}`).count() > 0);
   }
 
+  console.log('\n閲覧モード（既定）');
+  await page.locator('.tab[data-tab="data"]').click();
+  await page.waitForTimeout(300);
+  check('既定は閲覧モード', await page.locator('.mode-badge.is-view').count() === 1);
+  check('行を追加は押せない',
+    await page.locator('#panel-data .btn', { hasText: '行を追加' }).isDisabled());
+  {
+    const cell = page.locator('#panel-data td.cell[data-field="amount"]').first();
+    const before = await cell.innerText();
+    await cell.click();
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(250);
+    check('セル編集が始まらない', await page.locator('.cell-editor').count() === 0);
+    check('値が変わらない', (await cell.innerText()) === before);
+  }
+  await enableEdit(page);
+  check('編集を有効にできる', await page.locator('.mode-badge.is-edit').count() === 1);
+
   console.log('\nセル編集');
   await page.locator('.tab[data-tab="data"]').click();
   await page.waitForTimeout(200);
@@ -112,6 +138,37 @@ try {
   await page.waitForTimeout(400);
   check('合計再計算でエラー解消', await page.locator('.docbar-stats .chip-err').count() === 0);
 
+  console.log('\n元に戻す／やり直す');
+  {
+    const cell = page.locator('#panel-data td.cell[data-field="payeeName"]').nth(1);
+    const original = await cell.innerText();
+    await cell.click();
+    await page.keyboard.press('Enter');
+    await page.keyboard.press('Control+a');
+    await page.keyboard.type('ﾃｽﾄﾒｲｷﾞ');
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(400);
+    check('編集が反映される', (await cell.innerText()).includes('ﾃｽﾄﾒｲｷﾞ'));
+
+    await page.locator('#btn-undo').click();
+    await page.waitForTimeout(400);
+    check('元に戻せる',
+      (await page.locator('#panel-data td.cell[data-field="payeeName"]').nth(1).innerText()) === original,
+      await page.locator('#panel-data td.cell[data-field="payeeName"]').nth(1).innerText());
+
+    await page.locator('#btn-redo').click();
+    await page.waitForTimeout(400);
+    check('やり直せる',
+      (await page.locator('#panel-data td.cell[data-field="payeeName"]').nth(1).innerText()).includes('ﾃｽﾄﾒｲｷﾞ'));
+
+    await page.locator('#btn-restore-baseline').click();
+    await page.waitForTimeout(300);
+    await page.locator('#confirm-ok').click();
+    await page.waitForTimeout(500);
+    check('読み込み時点へ戻せる', await page.locator('#btn-show-diff').count() === 0);
+    check('戻すと未保存の変更が消える', await page.locator('#btn-restore-baseline').isDisabled());
+  }
+
   console.log('\n行操作と検索');
   await page.locator('#panel-data input[type="search"]').fill('0010');
   await page.waitForTimeout(300);
@@ -124,6 +181,14 @@ try {
   check('行追加', (await page.locator('#tab-count-data').textContent()).trim() === '11');
   await page.locator('#panel-data tbody tr').last().locator('.row-btn').click();
   await page.waitForTimeout(300);
+  check('削除前に確認する', await page.locator('#confirm-dialog[open]').count() === 1);
+  await page.locator('#confirm-cancel').click();
+  await page.waitForTimeout(300);
+  check('キャンセルすると消えない', (await page.locator('#tab-count-data').textContent()).trim() === '11');
+  await page.locator('#panel-data tbody tr').last().locator('.row-btn').click();
+  await page.waitForTimeout(300);
+  await page.locator('#confirm-ok').click();
+  await page.waitForTimeout(400);
   check('行削除', (await page.locator('#tab-count-data').textContent()).trim() === '10');
 
   console.log('\n生データの桁揃え');
@@ -257,6 +322,49 @@ try {
     check('検証エラーなし', await page.locator('.docbar-stats .chip-err').count() === 0);
   }
 
+  console.log('\n並べ替えの反映（レコード構成を壊さない）');
+  {
+    await page.evaluate(() => { window.onbeforeunload = null; });
+    await page.goto(base, { waitUntil: 'networkidle' });
+    await page.locator('.sample-chip', { hasText: '残高通知' }).first().click();
+    await page.waitForTimeout(600);
+    await enableEdit(page);
+    await page.locator('.tab[data-tab="data"]').click();
+    await page.waitForTimeout(300);
+
+    const kindsBefore = await page.evaluate(() => window.__zenginKinds());
+    check('元の構成は ヘッダ→データ→トレーラ が 2 組', kindsBefore === 'hddthddte', kindsBefore);
+
+    // 現在残高で並べ替えてファイルへ反映
+    await page.locator('#panel-data thead th', { hasText: '現在残高' }).first().click();
+    await page.waitForTimeout(300);
+    await page.locator('#panel-data .btn', { hasText: '並び順をファイルに反映' }).click();
+    await page.waitForTimeout(300);
+    check('反映前に確認する', await page.locator('#confirm-dialog[open]').count() === 1);
+    await page.locator('#confirm-ok').click();
+    await page.waitForTimeout(500);
+
+    const kindsAfter = await page.evaluate(() => window.__zenginKinds());
+    check('レコードの並び（種類）が変わらない', kindsAfter === kindsBefore,
+      `before=${kindsBefore} after=${kindsAfter}`);
+    check('データ件数が減らない', (await page.locator('#tab-count-data').textContent()).trim() === '4');
+    check('検証エラーが出ない', await page.locator('.docbar-stats .chip-err').count() === 0);
+
+    // 口座を絞り込んだ状態でも他口座が消えない
+    const selector = page.locator('#panel-data .table-toolbar select').first();
+    await selector.selectOption('0');
+    await page.waitForTimeout(300);
+    await page.locator('#panel-data thead th', { hasText: '現在残高' }).first().click();
+    await page.waitForTimeout(300);
+    await page.locator('#panel-data .btn', { hasText: '並び順をファイルに反映' }).click();
+    await page.waitForTimeout(300);
+    await page.locator('#confirm-ok').click();
+    await page.waitForTimeout(500);
+    check('絞り込み中でも他口座を失わない',
+      (await page.evaluate(() => window.__zenginKinds())) === kindsBefore);
+    check('絞り込み中でも件数が減らない', await page.evaluate(() => window.__zenginDataCount()) === 4);
+  }
+
   console.log('\n変更内容の差分確認');
   {
     await page.evaluate(() => { window.onbeforeunload = null; });
@@ -265,6 +373,7 @@ try {
     await page.waitForTimeout(600);
 
     check('編集前は変更バッジが出ない', await page.locator('#btn-show-diff').count() === 0);
+    await enableEdit(page);
 
     // 1 件セルを編集する
     await page.locator('.tab[data-tab="data"]').click();
@@ -303,8 +412,12 @@ try {
     await page.waitForTimeout(300);
 
     await page.locator('#panel-data tbody tr').last().locator('.row-btn').click();
+    await page.waitForTimeout(300);
+    await page.locator('#confirm-ok').click();
     await page.waitForTimeout(400);
     await page.locator('#panel-data tbody tr').nth(1).locator('.row-btn').click();
+    await page.waitForTimeout(300);
+    await page.locator('#confirm-ok').click();
     await page.waitForTimeout(400);
     await page.locator('#btn-show-diff').click();
     await page.waitForTimeout(400);
@@ -329,6 +442,7 @@ try {
     await page.goto(base, { waitUntil: 'networkidle' });
     await page.locator('.sample-chip', { hasText: '総合振込' }).first().click();
     await page.waitForTimeout(600);
+    await enableEdit(page);
     await page.locator('.tab[data-tab="data"]').click();
     await page.waitForTimeout(300);
 
@@ -381,6 +495,120 @@ try {
     check('書き出し確認画面を開かない', await page.locator('#export-dialog[open]').count() === 0);
     check('理由を通知する',
       (await page.locator('#toast-host').innerText()).includes('EBCDIC'));
+  }
+
+  console.log('\n分析タブ');
+  {
+    await page.evaluate(() => { window.onbeforeunload = null; });
+    await page.goto(base, { waitUntil: 'networkidle' });
+    await page.locator('.sample-chip', { hasText: '入出金取引明細' }).first().click();
+    await page.waitForTimeout(700);
+    await page.locator('.tab[data-tab="analysis"]').click();
+    await page.waitForTimeout(600);
+
+    const charts = await page.locator('#panel-analysis .chart').count();
+    check('図が複数出る', charts >= 3, String(charts));
+    check('日付別の推移がある',
+      (await page.locator('#panel-analysis').innerText()).includes('勘定日別'));
+    check('入金・出金の凡例がある', await page.locator('#panel-analysis .chart-legend-item').count() === 2);
+    check('金額の分布がある',
+      (await page.locator('#panel-analysis').innerText()).includes('取引金額の分布'));
+
+    // 図がはみ出していないこと
+    const overflow = await page.evaluate(() => {
+      const bad = [];
+      document.querySelectorAll('#panel-analysis .chart').forEach((chart) => {
+        const svg = chart.querySelector('.chart-svg');
+        if (!svg) return;
+        if (svg.getBoundingClientRect().right > chart.getBoundingClientRect().right + 1) {
+          bad.push(chart.querySelector('.chart-title').textContent);
+        }
+      });
+      return bad;
+    });
+    check('図が枠からはみ出さない', overflow.length === 0, overflow.join(' / '));
+
+    // 表示切り替え
+    const first = page.locator('#panel-analysis .chart').first();
+    await first.locator('button', { hasText: '表で見る' }).click();
+    await page.waitForTimeout(300);
+    check('表に切り替えられる', await first.locator('.chart-table').isVisible());
+    check('表に見出しがある', (await first.locator('.chart-table thead').innerText()).length > 0);
+    await first.locator('button', { hasText: '図で見る' }).click();
+    await page.waitForTimeout(300);
+    check('図に戻せる', await first.locator('.chart-svg').isVisible());
+
+    // 値を出すヒント
+    await page.locator('#panel-analysis .chart-bar').first().hover();
+    await page.waitForTimeout(250);
+    check('図にマウスを乗せると値が出る',
+      await page.locator('#panel-analysis .chart-tooltip:not([hidden])').count() >= 1);
+
+    // 総合振込でも分析できる
+    await page.evaluate(() => { window.onbeforeunload = null; });
+    await page.goto(base, { waitUntil: 'networkidle' });
+    await page.locator('.sample-chip', { hasText: '総合振込' }).first().click();
+    await page.waitForTimeout(600);
+    await page.locator('.tab[data-tab="analysis"]').click();
+    await page.waitForTimeout(500);
+    const text21 = await page.locator('#panel-analysis').innerText();
+    check('受取人名の上位が出る', text21.includes('受取人名別'), text21.slice(0, 160));
+    check('金融機関別が出る', text21.includes('被仕向銀行別'));
+    check('単一系列では凡例を出さない',
+      await page.locator('#panel-analysis .chart-legend').count() === 0);
+  }
+
+  console.log('\nCSV の書き出し');
+  {
+    await page.evaluate(() => { window.onbeforeunload = null; });
+    await page.goto(base, { waitUntil: 'networkidle' });
+    await page.locator('.sample-chip', { hasText: '総合振込' }).first().click();
+    await page.waitForTimeout(600);
+
+    const csv = await page.evaluate(() => ({
+      excel: window.Zengin.toCsv(window.__zenginDoc(), { excel: true }).split('\r\n')[1],
+      plain: window.Zengin.toCsv(window.__zenginDoc(), {}).split('\r\n')[1]
+    }));
+    check('Excel 用は先頭 0 を保つ', csv.excel.includes('="0010"'), csv.excel.slice(0, 80));
+    check('Excel 用でも金額は数値', /,716080,/.test(csv.excel), csv.excel.slice(0, 120));
+    check('標準はそのままの値', csv.plain.startsWith('1,0010,'), csv.plain.slice(0, 40));
+
+    // 混在レイアウトはレイアウトごとに区切る
+    const mixed = await page.evaluate(() => {
+      const codec = window.ZenginCharset.getCodec('shift_jis');
+      const F = window.ZenginFormats;
+      const timeFmt = F.withVariant(F.getFormat('03'), 'time');
+      const lines = codec.decode(window.ZenginSamples.build('03')).split('\r\n').filter(Boolean);
+      const hd = timeFmt.records.header;
+      const header2 = window.Zengin.blankRecord(timeFmt, 'header');
+      window.Zengin.setField(header2, hd.byKey.depositType, '6');
+      window.Zengin.setField(header2, hd.byKey.accountNumber, '7654321');
+      window.Zengin.setField(header2, hd.byKey.reserved, '0');
+      const data2 = window.Zengin.blankRecord(timeFmt, 'data');
+      window.Zengin.setField(data2, timeFmt.records.data.byKey.rate, '000100');
+      const trailer2 = window.Zengin.blankRecord(timeFmt, 'trailer');
+      const all = lines.slice(0, -1)
+        .concat([header2.text, data2.text, trailer2.text, lines[lines.length - 1]]);
+      const doc = window.Zengin.parse(codec.encode(all.join('\r\n') + '\r\n'), {});
+      return window.Zengin.toCsv(doc, {});
+    });
+    check('混在レイアウトは区切って出力', mixed.includes('■ '), mixed.slice(0, 120));
+    check('定期性の項目名が出る', mixed.includes('利率'), '未出力');
+    check('流動性の項目名も出る', mixed.includes('振込依頼人名・契約者番号'), '未出力');
+  }
+
+  console.log('\nホームへ戻る');
+  {
+    await page.evaluate(() => { window.onbeforeunload = null; });
+    await page.goto(base, { waitUntil: 'networkidle' });
+    await page.locator('.sample-chip').first().click();
+    await page.waitForTimeout(500);
+    check('作業画面になる', await page.evaluate(() => document.body.dataset.view) === 'workspace');
+    await page.locator('#btn-home').click();
+    await page.waitForTimeout(400);
+    check('ホームに戻る', await page.evaluate(() => document.body.dataset.view) === 'welcome');
+    check('作業画面が隠れる', !(await page.locator('#workspace').isVisible()));
+    check('もう一度読み込める', await page.locator('.sample-chip').first().isVisible());
   }
 
   console.log('\nテーマとレスポンシブ');
